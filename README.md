@@ -6,78 +6,77 @@
 
 ## Feature Engineering
 
-### MVP Feature Group 1: Price Dynamics
+### MVP Feature Group: Classic Technical Indicators
 
-本文档说明 MVP 特征工程中的价格动态特征组（Feature Group 1）。
+本文档说明 MVP 特征工程中的经典技术指标特征集。所有特征都是严格向后看的、连续值的，适合强化学习使用。
 
 #### 特征列表
 
-**1. Log Return (1-bar)**
-- **公式**: `log_return_1 = log(close_t / close_{t-1})`
-- **说明**: 单期对数收益率，衡量相邻两个时间点的价格变化。
+**1. Simple Moving Averages (SMA)**
+- **SMA20**: 20期简单移动平均
+- **SMA50**: 50期简单移动平均
+- **price_deviation_sma20**: `(close - SMA20) / SMA20` - 价格相对SMA20的偏离
+- **price_deviation_sma50**: `(close - SMA50) / SMA50` - 价格相对SMA50的偏离
+- **说明**: 移动平均线用于识别趋势方向，价格偏离可用于判断超买超卖。
 
-**2. Log Return (5-bar)**
-- **公式**: `log_return_5 = log(close_t / close_{t-5})`
-- **说明**: 5期对数收益率，衡量短期价格趋势。
+**2. Exponential Moving Averages (EMA)**
+- **EMA10**: 10期指数移动平均
+- **EMA20**: 20期指数移动平均
+- **EMA50**: 50期指数移动平均
+- **ema_slope_10**: `EMA10_t - EMA10_{t-1}` - EMA10的变化量
+- **ema_slope_20**: `EMA20_t - EMA20_{t-1}` - EMA20的变化量
+- **ema_slope_50**: `EMA50_t - EMA50_{t-1}` - EMA50的变化量
+- **说明**: EMA对价格变化更敏感，斜率可用于衡量趋势加速度。
 
-**3. Log Return (20-bar)**
-- **公式**: `log_return_20 = log(close_t / close_{t-20})`
-- **说明**: 20期对数收益率，衡量中期价格趋势。
+**3. MACD (Moving Average Convergence Divergence)**
+- **macd_line**: `EMA12 - EMA26` - MACD线
+- **macd_signal**: `EMA9 of MACD` - 信号线（MACD的9期EMA）
+- **macd_histogram**: `MACD - Signal` - MACD柱状图
+- **说明**: MACD用于识别趋势变化和动量，柱状图显示MACD与信号线的差异。
 
-**4. Rolling Volatility**
+**4. RSI (Relative Strength Index)**
+- **rsi_14**: 14期相对强弱指标（使用Wilder平滑方法）
 - **公式**: 
   ```
-  returns_t = log(close_t / close_{t-1})
-  rolling_volatility = sqrt(mean(returns_{t-i}^2 for i = 0 to W-1))
-  where W = 20
+  delta = close.diff()
+  gain = delta.clip(lower=0.0)
+  loss = (-delta).clip(lower=0.0)
+  avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+  avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+  rs = avg_gain / (avg_loss + eps)
+  rsi = 100 - (100 / (1 + rs))
   ```
-- **说明**: 滚动波动率，使用过去20期的收益率平方均值开方计算，衡量价格波动程度。
+- **说明**: RSI范围0-100，>70表示超买，<30表示超卖。
 
-**5. High-Low Range**
-- **公式**: `high_low_range = (high_t - low_t) / close_t`
-- **说明**: 高低价范围相对于收盘价的比例，衡量单期内的价格波动幅度。
+**5. Rolling Volatility**
+- **rolling_volatility_20**: 20期滚动波动率
+- **公式**: `std(log(close_t / close_{t-1}))` over 20-period window
+- **说明**: 对数收益率的滚动标准差，衡量价格波动程度。
 
-**6. Price vs EMA Deviation**
-- **公式**: 
-  ```
-  ema_20 = exponential_moving_average(close, window = 20)
-  price_ema_deviation = (close_t - ema_20) / ema_20
-  ```
-- **说明**: 收盘价相对于20期指数移动平均线的偏离程度，衡量价格是否偏离趋势。
+**6. Bollinger Bands**
+- **bb_width**: 布林带带宽 `(upper_band - lower_band) / middle_band`
+- **bb_price_position**: 价格在带内的位置 `(close - lower_band) / (upper_band - lower_band)`
+- **参数**: window=20, k=2（2倍标准差）
+- **说明**: 带宽衡量波动性，价格位置（0-1）表示价格在带内的相对位置。
 
-**7. EMA Slope**
-- **公式**: 
-  ```
-  ema_20 = exponential_moving_average(close, window = 20)
-  ema_slope = ema_20_t - ema_20_{t-1}
-  ```
-- **说明**: EMA的变化量，衡量趋势的加速度或方向变化。
+**7. Volume Moving Average**
+- **volume_ma_20**: 20期成交量移动平均
+- **volume_ratio**: `volume / volume_ma_20` - 成交量相对均值的比例
+- **说明**: 用于识别异常成交量，volume_ratio > 1表示成交量高于平均水平。
 
-**8. VWAP Deviation**
-- **公式**: `vwap_deviation = (close_t - vwap_t) / vwap_t`
-- **说明**: 收盘价相对于成交量加权平均价格（VWAP）的偏离程度。VWAP使用过去20期的典型价格（(high + low + close) / 3）和成交量计算。
+**8. On-Balance Volume (OBV)**
+- **obv**: 能量潮指标
+- **计算逻辑**: 
+  - 如果 close_t > close_{t-1}: OBV_t = OBV_{t-1} + volume_t
+  - 如果 close_t < close_{t-1}: OBV_t = OBV_{t-1} - volume_t
+  - 如果 close_t = close_{t-1}: OBV_t = OBV_{t-1}
+- **说明**: OBV用于识别资金流向，OBV上升表示资金流入。
 
-**9. Price Position in Recent Range**
-- **公式**: 
-  ```
-  recent_low = min(low_{t-W} to low_t)
-  recent_high = max(high_{t-W} to high_t)
-  price_range_position = (close_t - recent_low) / (recent_high - recent_low)
-  where W = 20
-  ```
-- **说明**: 当前收盘价在过去20期价格区间中的相对位置，范围在0到1之间。0表示接近最低价，1表示接近最高价。
-
-**10. Trend vs Chop Indicator**
-- **公式**: 
-  ```
-  ema_short = exponential_moving_average(close, window = 10)
-  ema_long = exponential_moving_average(close, window = 30)
-  returns_t = log(close_t / close_{t-1})
-  volatility = sqrt(mean(returns_{t-i}^2 for i = 0 to W-1))
-  where W = 20
-  trend_strength = abs(ema_short - ema_long) / volatility
-  ```
-- **说明**: 趋势强度指标，衡量短期和长期EMA的差异相对于波动率的比例。值越大表示趋势越强，值越小表示市场处于震荡（chop）状态。
+**9. VWAP (Volume Weighted Average Price)**
+- **vwap**: 成交量加权平均价格（20期滚动窗口）
+- **vwap_deviation**: `(close - VWAP) / VWAP` - 价格相对VWAP的偏离
+- **计算**: `VWAP = sum(typical_price * volume) / sum(volume)` where `typical_price = (high + low + close) / 3`
+- **说明**: VWAP是机构常用的参考价格，价格偏离VWAP可能表示市场情绪变化。
 
 #### 技术细节
 
@@ -87,40 +86,45 @@
 - 时间索引应为 datetime 类型
 
 **窗口参数**
-- Rolling Volatility: W = 20
-- Price Position in Recent Range: W = 20
-- EMA (短期): span = 10
-- EMA (长期): span = 30
-- VWAP: window = 20
+- SMA: 20, 50
+- EMA: 10, 20, 50
+- MACD: fast=12, slow=26, signal=9
+- RSI: window=14
+- Rolling Volatility: window=20
+- Bollinger Bands: window=20, k=2
+- Volume MA: window=20
+- VWAP: window=20
 
 **注意事项**
 1. 所有特征计算都是**严格向后看**的，避免前瞻偏差
 2. 使用 `min_periods` 参数确保在窗口不足时返回 NaN
-3. 在除法运算中添加小常数（1e-10）避免除零错误
-4. 对数收益率使用 `np.log()` 计算，比百分比收益率更适合金融建模
+3. 在除法运算中添加小常数（epsilon=1e-10）避免除零错误
+4. RSI使用Wilder平滑方法（RMA），alpha=1/window
+5. OBV使用累积计算，初始值为第一个成交量
 
 **特征用途**
 这些特征可用于：
 - 强化学习环境的状态空间
 - 机器学习模型的输入特征
 - 技术分析和量化策略的信号生成
+- 市场状态分类和模式识别
 
 #### 使用方法
 
 ```python
-from mvp_feature import load_data, create_price_dynamics_features
+from mvp_feature import load_data, create_technical_indicators, get_feature_columns
 
 # 加载数据
 df = load_data('./data/BTCUSDT/5m/klines_2025_01.csv')
 
-# 创建特征
-df = create_price_dynamics_features(df)
+# 创建技术指标特征
+df = create_technical_indicators(df)
+
+# 获取所有特征列
+feature_cols = get_feature_columns(df)
 
 # 访问特征
-features = df[['log_return_1', 'log_return_5', 'log_return_20', 
-               'rolling_volatility', 'high_low_range', 'price_ema_deviation',
-               'ema_slope', 'vwap_deviation', 'price_range_position', 
-               'trend_strength']]
+features = df[feature_cols]
 ```
 
 ## How to use
