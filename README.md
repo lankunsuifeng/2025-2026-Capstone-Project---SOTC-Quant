@@ -78,6 +78,14 @@
 - **计算**: `VWAP = sum(typical_price * volume) / sum(volume)` where `typical_price = (high + low + close) / 3`
 - **说明**: VWAP是机构常用的参考价格，价格偏离VWAP可能表示市场情绪变化。
 
+**10. Regime-oriented Features (市场状态分类特征)**
+- **trend_sign_fast**: 短期趋势方向 `sign(EMA_10 - EMA_20)`，值在 {-1, 0, +1}
+- **trend_sign_medium**: 中期趋势方向 `sign(EMA_20 - EMA_50)`，值在 {-1, 0, +1}
+- **trend_strength**: 趋势强度（无标度）`|EMA_20 - EMA_50| / close_price`，连续非负值
+- **vol_zscore**: 波动率相对水平 `(vol - rolling_mean(vol)) / rolling_std(vol)`，使用100期窗口计算波动率的滚动z-score
+- **delta_vol**: 波动率变化 `rolling_vol_t - rolling_vol_{t-1}`，捕获市场风险的变化
+- **说明**: 这些特征专门设计用于市场状态分类器，强调稳定性、可解释性和状态感知能力。不包含硬交易规则，仅作为状态输入。
+
 #### 技术细节
 
 **数据要求**
@@ -94,6 +102,7 @@
 - Bollinger Bands: window=20, k=2
 - Volume MA: window=20
 - VWAP: window=20
+- Volatility Z-score: window=100 (用于计算波动率的滚动均值和标准差)
 
 **注意事项**
 1. 所有特征计算都是**严格向后看**的，避免前瞻偏差
