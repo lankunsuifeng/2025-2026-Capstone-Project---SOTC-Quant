@@ -5,7 +5,7 @@ from datetime import datetime
 import time
 
 def fetch_binance_klines(symbol="BTCUSDT", interval="5m", start_time_ms=None, limit=1000):
-    url = "https://api.binance.com/api/v3/klines"
+    url = "https://api.binance.us/api/v3/klines"
     limit = 1000  # Max limit per request
     all_data = []
 

@@ -12,4 +12,5 @@ st.markdown("""
 - **Model Training:** Train model using LSTM Algo
 - **Tuning:** Tuner for HMM and LSTM
 - **Live Implementation:** Live inference of the model on real-time data
+- **Historical Prediction Visualization:** Visualize model predictions on historical data
 """)
