@@ -13,7 +13,7 @@ KL_LIMIT = 1000
 AGG_LIMIT = 1000
 DEFAULT_CHUNK_MINUTES = 5
 MAX_WORKERS = 6
-SPOT_BASE = "https://api.binance.com"
+SPOT_BASE = "https://api.binance.us"
 FUTURES_BASE = "https://fapi.binance.com"
 RETRY_SLEEP = 0.5
 
