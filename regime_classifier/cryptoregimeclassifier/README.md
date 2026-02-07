@@ -128,9 +128,10 @@ pip install -r requirements.txt
 
  Usage
 --------
-
+cd regime_classifier
+cd CryptoMarket_Regime_Classifier
 Run the full pipeline:
-streamlit run dashboard/app.py
+
 
 
 Models & scalers will be saved in /models for reuse.
