@@ -5,11 +5,51 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from hmmlearn import hmm
 
-def get_hmm_features(df, feature_list, n_components=None, scale=True, use_pca=True):
+# Import autoencoder (optional, will be imported only if needed)
+try:
+    from .autoencoder import CNNAutoencoder
+    AUTOENCODER_AVAILABLE = True
+except ImportError:
+    try:
+        from autoencoder import CNNAutoencoder
+        AUTOENCODER_AVAILABLE = True
+    except ImportError:
+        AUTOENCODER_AVAILABLE = False
+        CNNAutoencoder = None
+
+def get_hmm_features(df, feature_list, n_components=None, scale=True, 
+                     use_pca=True, use_autoencoder=False, autoencoder_epochs=100,
+                     progress_callback=None):
     """
-    Selects features, drops NA rows, scales, and (optionally) applies PCA.
-    Returns: X, scaler, pca_model
-    - n_components: PCA components (int) if use_pca else ignored
+    Selects features, drops NA rows, scales, and (optionally) applies PCA or Autoencoder.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        输入数据框
+    feature_list : list
+        特征列名列表
+    n_components : int, optional
+        降维后的维度（PCA components 或 Autoencoder latent_dim）
+    scale : bool
+        是否标准化
+    use_pca : bool
+        是否使用PCA降维
+    use_autoencoder : bool
+        是否使用Autoencoder降维（如果True，会覆盖use_pca）
+    autoencoder_epochs : int
+        Autoencoder训练轮数
+    progress_callback : callable, optional
+        进度回调函数，用于Autoencoder训练时显示进度
+    
+    Returns:
+    --------
+    X : np.array
+        降维后的特征矩阵
+    scaler : StandardScaler or None
+        标准化器
+    reduction_model : PCA or DenseAutoencoder or None
+        降维模型（PCA或Autoencoder）
     """
     features = df[feature_list].copy()
     features = features.dropna(axis=0, how='any')
@@ -21,17 +61,35 @@ def get_hmm_features(df, feature_list, n_components=None, scale=True, use_pca=Tr
         scaler = StandardScaler()
         X = scaler.fit_transform(features.values)
 
-    pca_model = None
-    if use_pca:
+    reduction_model = None
+    
+    # 优先使用Autoencoder（如果可用且启用）
+    if use_autoencoder and AUTOENCODER_AVAILABLE:
+        input_dim = X.shape[1]
+        latent_dim = n_components if n_components is not None else 12
+        
+        reduction_model = CNNAutoencoder(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            filters=[64, 32, 16],
+            kernel_size=3,
+            dropout_rate=0.2,
+            random_state=42
+        )
+        
+        # 训练并降维
+        X = reduction_model.fit_transform(X, epochs=autoencoder_epochs, verbose=0, progress_callback=progress_callback)
+        
+    elif use_pca:
         if n_components is None:
             # keep full rank if not specified
             n_components = min(features.shape[0], features.shape[1])
-        pca_model = PCA(n_components=n_components, random_state=42)
-        X = pca_model.fit_transform(X)
+        reduction_model = PCA(n_components=n_components, random_state=42)
+        X = reduction_model.fit_transform(X)
         # Optionally log variance explained (caller can print if needed)
-        # print(f"PCA explained variance ratio: {np.sum(pca_model.explained_variance_ratio_):.4f}")
+        # print(f"PCA explained variance ratio: {np.sum(reduction_model.explained_variance_ratio_):.4f}")
 
-    return X, scaler, pca_model
+    return X, scaler, reduction_model
 
 def train_hmm(features, n_states=3, n_iter=150, random_state=42):
     """
