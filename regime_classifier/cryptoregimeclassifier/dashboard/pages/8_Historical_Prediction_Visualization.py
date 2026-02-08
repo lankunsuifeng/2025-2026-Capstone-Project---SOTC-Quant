@@ -8,7 +8,7 @@ import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from tensorflow.keras.models import load_model
+import tensorflow as tf
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     confusion_matrix, classification_report, r2_score,
@@ -87,7 +87,7 @@ def load_model_artifacts(model_folder_path: str):
     if not all(os.path.exists(p) for p in [model_path, scaler_path, metadata_path]):
         raise FileNotFoundError(f"Missing model files in {model_folder_path}")
     
-    model = load_model(model_path)
+    model = tf.keras.models.load_model(model_path)
     scaler = joblib.load(scaler_path)
     with open(metadata_path, 'r') as f:
         metadata = json.load(f)
