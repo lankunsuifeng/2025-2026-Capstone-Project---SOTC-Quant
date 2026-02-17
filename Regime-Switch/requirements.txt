@@ -1,0 +1,16 @@
+# MSGARCH BTC/USD Model Requirements
+# Markov-switching GARCH model dependencies
+
+# Core data processing
+numpy>=1.21.0
+pandas>=1.3.0
+
+# Statistical modeling
+statsmodels>=0.13.0
+arch>=5.0.0
+
+# Data visualization
+matplotlib>=3.4.0
+
+# Cryptocurrency data fetching
+ccxt>=2.0.0
