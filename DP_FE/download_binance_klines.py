@@ -3,8 +3,8 @@
 
 #使用方法：
 # pip install requests pandas pyarrow
-# python .\download_binance_klines.py --symbol BTCUSDT --interval 5m --start 2015-01-01 --end 2025-12-31 --outdir .\data --format csv
-
+# python .\download_binance_klines.py --symbol BTCUSDT --interval 1h --start 2017-01-01 --end 2026-01-01 --outdir .\data --format csv
+# data range: 2019-09-23 08:00:00+00:00 to 2026-01-01
 
 """
 
