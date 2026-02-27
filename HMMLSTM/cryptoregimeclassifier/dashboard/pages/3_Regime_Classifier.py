@@ -9,7 +9,6 @@ import joblib
 # add src path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from src.regime_label import get_hmm_features, train_hmm, map_states_to_regimes  # <- unify import
-from src.gpu_utils import setup_gpu, get_gpu_info
 
 DATA_FOLDER = "data/"
 MODELS_FOLDER = "models/"
@@ -55,51 +54,23 @@ n_states = st.slider("Number of HMM states", min_value=2, max_value=8, value=4, 
 st.sidebar.subheader("Dimensionality Reduction")
 use_scaler = st.sidebar.checkbox("Scale (StandardScaler)", value=True)
 
-# Choose between PCA and CNN Autoencoder
+# 仅支持 None / PCA，移除 CNN Autoencoder 和 GPU 相关逻辑
 reduction_method = st.sidebar.radio(
     "Reduction method",
-    options=["None", "PCA", "CNN Autoencoder"],
+    options=["None", "PCA"],
     index=1,  # Default to PCA
-    help="PCA: Fast linear reduction. CNN Autoencoder: Uses 1D convolutions to capture local patterns, slower but captures non-linear relationships."
+    help="PCA: Fast linear reduction. Select 'None' to use raw (scaled) features."
 )
 
 n_components = None
 if reduction_method == "PCA":
     max_dim = max(1, len(hmm_features))
     n_components = st.sidebar.slider(
-        "PCA components", 
-        min_value=1, 
-        max_value=max_dim, 
+        "PCA components",
+        min_value=1,
+        max_value=max_dim,
         value=min(4, max_dim)
     )
-elif reduction_method == "CNN Autoencoder":
-    max_dim = max(1, len(hmm_features))
-    n_components = st.sidebar.slider(
-        "Latent dimension", 
-        min_value=2, 
-        max_value=min(20, max_dim), 
-        value=12,
-        help="Dimension of the encoded representation (CNN Autoencoder output)"
-    )
-    autoencoder_epochs = st.sidebar.number_input(
-        "CNN Autoencoder epochs",
-        min_value=10,
-        max_value=500,
-        value=100,
-        step=10,
-        help="More epochs = better quality but slower training"
-    )
-    # 获取GPU信息
-    gpu_info = get_gpu_info()
-    enable_gpu_autoencoder = st.sidebar.checkbox(
-        "Enable GPU for Autoencoder training",
-        value=gpu_info['available'],
-        help=f"GPU available: {gpu_info['available']}. Device: {gpu_info['device_name']}"
-    )
-else:
-    autoencoder_epochs = 100
-    enable_gpu_autoencoder = False
-    gpu_info = {'available': False}
 
 # --- Train action ---
 if st.button("Train HMM and label"):
@@ -126,31 +97,13 @@ if st.button("Train HMM and label"):
         progress_bar.progress(5)
         
         use_pca = (reduction_method == "PCA")
-        use_autoencoder = (reduction_method == "CNN Autoencoder")
-        
-        # 配置GPU（如果使用Autoencoder且启用GPU）
-        if use_autoencoder and enable_gpu_autoencoder and gpu_info['available']:
-            setup_gpu(memory_growth=True)
-            status_text.text(f"🚀 Using GPU: {gpu_info['device_name']}")
-            progress_bar.progress(8)
-        
-        # 定义进度回调函数（用于Autoencoder训练）
-        autoencoder_progress = None
-        if use_autoencoder:
-            def autoencoder_progress(epoch, total_epochs, loss, val_loss):
-                progress_pct = 5 + int((epoch / total_epochs) * 50)  # 5% to 55%
-                progress_bar.progress(min(progress_pct, 55))
-                status_text.text(
-                    f"🤖 Step 2/5: Training CNN Autoencoder... "
-                    f"Epoch {epoch}/{total_epochs} | Loss: {loss:.4f} | Val Loss: {val_loss:.4f}"
-                )
-        
-        # Step 2: 特征降维（可能包含Autoencoder训练）
-        if use_autoencoder:
-            status_text.text(f"🤖 Step 2/5: Training CNN Autoencoder ({autoencoder_epochs} epochs)... This may take a few minutes...")
-            progress_bar.progress(10)
-        else:
+
+        # Step 2: 特征降维（仅 PCA 或不降维）
+        if use_pca:
             status_text.text("📉 Step 2/5: Applying PCA reduction...")
+            progress_bar.progress(30)
+        else:
+            status_text.text("📉 Step 2/5: Skipping dimensionality reduction (using raw features)...")
             progress_bar.progress(30)
         
         X, scaler, reduction_model = get_hmm_features(
@@ -158,10 +111,7 @@ if st.button("Train HMM and label"):
             feature_list=hmm_features,
             n_components=n_components,
             scale=use_scaler, 
-            use_pca=use_pca,
-            use_autoencoder=use_autoencoder,
-            autoencoder_epochs=autoencoder_epochs if use_autoencoder else 100,
-            progress_callback=autoencoder_progress
+            use_pca=use_pca
         )
         
         # Step 3: 训练HMM
@@ -190,7 +140,7 @@ if st.button("Train HMM and label"):
         st.session_state['labeled_df'] = labeled_df
         st.session_state['hmm_model'] = hmm_model
         st.session_state['scaler'] = scaler
-        st.session_state['reduction_model'] = reduction_model  # PCA or Autoencoder
+        st.session_state['reduction_model'] = reduction_model  # PCA or None
         st.session_state['reduction_method'] = reduction_method
         st.session_state['hmm_features'] = hmm_features
         st.session_state['state_mapping'] = state_mapping
@@ -248,8 +198,7 @@ if 'labeled_df' in st.session_state:
     reduction_method = st.session_state.get('reduction_method', 'None')
     reduction_label = {
         'None': 'No reduction',
-        'PCA': 'PCA',
-        'CNN Autoencoder': 'CNN Autoencoder'
+        'PCA': 'PCA'
     }.get(reduction_method, 'Unknown')
     
     st.markdown(f"- Observations used: **{n_obs}**  \n- HMM states: **{n_components}**  \n- Reduction method: **{reduction_label}**  \n- Feature dims (after reduction): **{n_features}**")
@@ -302,7 +251,7 @@ if 'labeled_df' in st.session_state:
         artifact = {
             'hmm_model': hmm_model,
             'scaler': st.session_state.get('scaler', None),
-            'reduction_model': st.session_state.get('reduction_model', None),  # PCA or Autoencoder
+            'reduction_model': st.session_state.get('reduction_model', None),  # PCA or None
             'reduction_method': st.session_state.get('reduction_method', 'None'),
             'features': st.session_state.get('hmm_features', []),
             'state_mapping': st.session_state.get('state_mapping', {}),

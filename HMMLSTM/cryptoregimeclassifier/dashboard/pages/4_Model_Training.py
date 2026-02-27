@@ -98,16 +98,6 @@ epochs = st.sidebar.number_input("Epochs", 10, 200, 50, 5)
 batch_size = st.sidebar.select_slider("Batch Size", options=[32, 64, 128, 256], value=128)
 
 if st.button("Train LSTM Model", type="primary"):
-    gpus = tf.config.list_physical_devices('GPU')
-    if len(gpus) > 0:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            st.info(f"Using GPU: {gpus[0].name}")
-        except RuntimeError as e:
-            st.warning(f"Error setting up GPU: {e}") 
-    else:
-        st.info("No GPU available. Training on CPU.")          
     model = build_lstm_model(
         input_shape=(X_train_seq.shape[1], X_train_seq.shape[2]),
         num_classes=num_classes,
