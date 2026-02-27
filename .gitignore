@@ -24,3 +24,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Large data files (too big for GitHub)
+RL_model/*.csv
+RL_model/backtest_steps.csv
+RL_model/plots/*.png
+RL_model/ppo_policy.pt
