@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from typing import Tuple, Dict, Optional,List
-
+import matplotlib.pyplot as plt
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -39,7 +40,7 @@ def df_to_arrays(df:pd.DataFrame,feature_cols:List[str],close_col:str = "close",
 @dataclass
 class TradingEnvConfig:
     fee_bps: float = 2.0
-    hold_cost_bps : float = 0.0
+    hold_cost_bps : float = 2.0
     max_episode_steps : Optional[int] = 5000
     random_start: bool = True
     start_index: int = 1
@@ -88,13 +89,13 @@ class TradingEnv:
             raise ValueError("Action Error")
         new_pos = action
 
-        # LogReturn
-        ret = float(np.log((self.close[self.t]+1e-12)/(self.close[self.t-1]+1e-12)))
+        # Return
+        ret = np.log((self.close[self.t] + 1e-12) / (self.close[self.t-1] + 1e-12))
         turnover = abs(new_pos - self.pos)
         cost_fee = self.fee * turnover
-        cost_hold = self.hold_cost * abs(self.pos)
-        reward = self.pos * ret - cost_fee - cost_hold
-
+        cost_hold = self.hold_cost * abs(new_pos)
+        reward = new_pos * ret - cost_fee - cost_hold
+        reward = 1000 * reward
         self.pos = new_pos
         self.t += 1
         self.steps += 1
@@ -102,11 +103,12 @@ class TradingEnv:
         done = self.t >= self.T
         if self.cfg.max_episode_steps is not None:
             done = done or (self.steps >= self.cfg.max_episode_steps)
-        obs = self.X[self.t-1] if not done else self.X[self.T-1]
+        next_t = min(self.t, self.T - 1)
+        obs = self.X[next_t]
 
         info = {
 
-            "t":self.t - 1,
+            "t":next_t,
             "ret":ret,
             "pos":self.pos,
             "turnover":turnover,
@@ -122,14 +124,14 @@ class PPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.1
     vf_coef: float = 0.5
     lr: float = 3e-4
     max_grad_norm: float = 0.5
     rollout_steps: int = 2048
     minibatch_size: int = 256
     update_epochs: int = 10
-
+    hidden:int = 128
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 class ActorCritic(nn.Module):
@@ -137,8 +139,10 @@ class ActorCritic(nn.Module):
         super().__init__()
         self.backbone = nn.Sequential(
             nn.Linear(obs_dim,hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
             nn.Linear(hidden,hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
         )
         self.pi = nn.Linear(hidden,n_actions)
@@ -176,13 +180,18 @@ class RollingBuffer:
         self.ptr += 1
 
     def compute_gae(self,last_value,gamma,lam):
-        adv = 0.0
+        adv = torch.zeros((), device=self.device)
         for t in reversed(range(self.size)):
             mask = 1.0 - self.dones[t]
             next_value = last_value if t == self.size -1 else self.values[t+1]
             delta = self.rewards[t] + gamma*next_value*mask - self.values[t]
             adv = delta + gamma*lam*mask*adv
             self.advantages[t] = adv
+        self.returns[:] = self.advantages + self.values
+        adv_mean = self.advantages.mean()
+        adv_std = self.advantages.std() + 1e-12
+        self.advantages[:] = (self.advantages - adv_mean)/adv_std
+        
     def minibatches(self,batch_size):
         idx = torch.randperm(self.size,device=self.device)
         for start in range(0,self.size,batch_size):
@@ -207,84 +216,186 @@ class PPOAgent:
         dist = torch.distributions.Categorical(logits=logits)
         act_idx = dist.sample()
         logprob = dist.log_prob(act_idx)
-        return act_idx.squeeze(0),logprob(act_idx), value.squeeze(0)
+        return act_idx.squeeze(0),logprob.squeeze(0), value.squeeze(0)
     
-    def train(self,total_updates = 200,log_every = 10):
+    def train(self, total_updates=200, log_every=10, plot_path: str = "RLModel/train_plots/training_curves.png"):
+        os.makedirs(os.path.dirname(plot_path) or ".", exist_ok=True)
+
         obs_dim = self.env.X.shape[1]
         obs_np = self.env.reset()
-        obs = torch.tensor(obs_np,device = self.device)
+        obs = torch.tensor(obs_np, device=self.device)
+
+        history = {
+            "upd": [],
+            "rollout_reward_mean": [],
+            "rollout_reward_sum": [],
+            "rollout_abspos_mean": [],
+            "rollout_turnover_mean": [],
+            "rollout_fee_sum": [],
+            "pi_loss": [],
+            "v_loss": [],
+            "entropy": [],
+        }
 
         for upd in range(total_updates):
-            buf = RollingBuffer(self.cfg.rollout_steps,obs_dim,self.device)
+            buf = RollingBuffer(self.cfg.rollout_steps, obs_dim, self.device)
+
+            # --- rollout stats ---
+            r_sum = 0.0
+            fee_sum = 0.0
+            abspos_sum = 0.0
+            turnover_sum = 0.0
 
             for _ in range(self.cfg.rollout_steps):
                 with torch.no_grad():
                     act_idx, logprob, value = self.act(obs)
+
                 env_action = int(self.IDX_TO_ACT[int(act_idx.item())])
-                next_obs_np, reward, done, _info = self.env.step(env_action)
+                next_obs_np, reward, done, info = self.env.step(env_action)
 
-                buf.add(obs=obs,
-                        act_idx=act_idx,
-                        reward = torch.tensor(reward,device = self.device),
-                        done = torch.tensor(float(done),device = self.device),
-                        logprob=logprob,
-                        value = value,)
-                
-                if done:
-                    obs_np = self.env.reset()
-                else:
-                    obs_np = next_obs_np
-                obs = torch.tensor(obs_np,device=self.device)
+                # stats (use info from env)
+                r_sum += float(reward)
+                fee_sum += float(info.get("fee", 0.0))
+                abspos_sum += abs(float(info.get("pos", 0.0)))
+                turnover_sum += float(info.get("turnover", 0.0))
 
+                buf.add(
+                    obs=obs,
+                    act_idx=act_idx,
+                    reward=torch.tensor(reward, device=self.device),
+                    done=torch.tensor(float(done), device=self.device),
+                    logprob=logprob,
+                    value=value,
+                )
+
+                obs_np = self.env.reset() if done else next_obs_np
+                obs = torch.tensor(obs_np, device=self.device)
 
             with torch.no_grad():
                 _, last_value = self.model(obs.unsqueeze(0))
-            buf.compute_gae(float(last_value.item()),self.cfg.gamma,self.cfg.gae_lambda)
+            buf.compute_gae(float(last_value.item()), self.cfg.gamma, self.cfg.gae_lambda)
 
-            last_pi_loss = last_v_loss = last_ent = 0.0
+            pi_sum = v_sum = ent_sum = 0.0
+            n_mb = 0.0
 
+            # --- PPO update ---
             for _ in range(self.cfg.update_epochs):
                 for mb_obs, mb_act, mb_oldlog, mb_adv, mb_ret in buf.minibatches(self.cfg.minibatch_size):
-                    logits,values = self.model(mb_obs)
-                    dist = torch.distributions.Categorical(logits = logits)
+                    logits, values = self.model(mb_obs)
+                    dist = torch.distributions.Categorical(logits=logits)
                     newlog = dist.log_prob(mb_act)
                     entropy = dist.entropy().mean()
 
-                    ratio = torch.exp(newlog-mb_oldlog)
+                    ratio = torch.exp(newlog - mb_oldlog)
                     surr1 = ratio * mb_adv
-                    surr2 = torch.clamp(ratio,1.0-self.cfg.clip_eps,1.0+self.cfg.clip_eps)*mb_adv
-                    pi_loss = -torch.min(surr1,surr2).mean()
+                    surr2 = torch.clamp(ratio, 1.0 - self.cfg.clip_eps, 1.0 + self.cfg.clip_eps) * mb_adv
+                    pi_loss = -torch.min(surr1, surr2).mean()
 
-                    v_loss = ((values-mb_ret)**2).mean()
-                    loss = pi_loss + self.cfg.vf_coef*v_loss-self.cfg.ent_coef*entropy
+                    v_loss = ((values - mb_ret) ** 2).mean()
+                    loss = pi_loss + self.cfg.vf_coef * v_loss - self.cfg.ent_coef * entropy
 
                     self.opt.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.parameters(),self.cfg.max_grad_norm)
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.max_grad_norm)
                     self.opt.step()
 
-                    last_pi_loss = float(pi_loss.item())
-                    last_v_loss = float(v_loss.item)
-                    last_ent = float(entropy.item())
+                    pi_sum += float(pi_loss.item())
+                    v_sum  += float(v_loss.item())
+                    ent_sum += float(entropy.item())
+                    n_mb += 1
+            avg_pi_loss = pi_sum/max(n_mb,1)
+            avg_v_loss = v_sum/max(n_mb,1)
+            avg_ent = ent_sum/max(n_mb,1)
 
-            if (upd + 1) % log_every == 0:
-                print(f"[PPO] upd={upd+1}/{total_updates}")
+            # --- logging & record ---
+            if (upd + 1) % log_every == 0 or upd == 0:
+                r_mean = r_sum / self.cfg.rollout_steps
+                abspos_mean = abspos_sum / self.cfg.rollout_steps
+                turnover_mean = turnover_sum / self.cfg.rollout_steps
+
+                history["upd"].append(upd + 1)
+                history["rollout_reward_mean"].append(r_mean)
+                history["rollout_reward_sum"].append(r_sum)
+                history["rollout_abspos_mean"].append(abspos_mean)
+                history["rollout_turnover_mean"].append(turnover_mean)
+                history["rollout_fee_sum"].append(fee_sum)
+                history["pi_loss"].append(avg_pi_loss)
+                history["v_loss"].append(avg_v_loss)
+                history["entropy"].append(avg_ent)
+
+                print(
+                    f"[PPO] upd={upd+1}/{total_updates} "
+                    f"r_mean={r_mean:.3e} r_sum={r_sum:.3e} "
+                    f"|pos|={abspos_mean:.3f} turn={turnover_mean:.3f} fee_sum={fee_sum:.3e} "
+                    f"pi={avg_pi_loss:.3e} v={avg_v_loss:.3e} ent={avg_ent:.3e}"
+                )
+
+        # --- plot after training ---
+        if len(history["upd"]) > 0:
+            x = np.array(history["upd"], dtype=int)
+
+            import matplotlib.pyplot as plt
+            plt.figure()
+            plt.plot(x, np.array(history["rollout_reward_mean"], dtype=float))
+            plt.title("Rollout Reward Mean")
+            plt.xlabel("update")
+            plt.ylabel("mean reward")
+            plt.savefig(plot_path.replace(".png", "_reward_mean.png"), dpi=150, bbox_inches="tight")
+            plt.close()
+
+            plt.figure()
+            plt.plot(x, np.array(history["rollout_reward_sum"], dtype=float))
+            plt.title("Rollout Reward Sum")
+            plt.xlabel("update")
+            plt.ylabel("sum reward")
+            plt.savefig(plot_path.replace(".png", "_reward_sum.png"), dpi=150, bbox_inches="tight")
+            plt.close()
+
+            plt.figure()
+            plt.plot(x, np.array(history["rollout_abspos_mean"], dtype=float), label="mean |pos|")
+            plt.plot(x, np.array(history["rollout_turnover_mean"], dtype=float), label="mean turnover")
+            plt.title("Position / Turnover")
+            plt.xlabel("update")
+            plt.legend()
+            plt.savefig(plot_path.replace(".png", "_pos_turn.png"), dpi=150, bbox_inches="tight")
+            plt.close()
+
+            plt.figure()
+            plt.plot(x, np.array(history["entropy"], dtype=float))
+            plt.title("Policy Entropy")
+            plt.xlabel("update")
+            plt.ylabel("entropy")
+            plt.savefig(plot_path.replace(".png", "_entropy.png"), dpi=150, bbox_inches="tight")
+            plt.close()
+
+            plt.figure()
+            plt.plot(x, np.array(history["pi_loss"], dtype=float), label="pi_loss")
+            plt.plot(x, np.array(history["v_loss"], dtype=float), label="v_loss")
+            plt.title("Losses")
+            plt.xlabel("update")
+            plt.legend()
+            plt.savefig(plot_path.replace(".png", "_loss.png"), dpi=150, bbox_inches="tight")
+            plt.close()
+
+            # optional: save history to csv
+            hist_df = pd.DataFrame(history)
+            hist_csv = plot_path.replace(".png", "_history.csv")
+            hist_df.to_csv(hist_csv, index=False)
+            print(f"[train] saved plots + history: {plot_path.replace('.png','_*.png')} and {hist_csv}")
 
         return self
-    
+        
 
     def save(self,path):
         torch.save(
             {
-                "state_dict":self.model.state_dict(),
-                "cfg":self.cfg 
-
+                "state_dict":self.model.state_dict()
             },
             path,
         )
 
-    def load(self,path):
-        ckpt = torch.load(path,map_location=self.device)
+    def load(self, path):
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(ckpt["state_dict"])
         return self
     
@@ -292,21 +403,20 @@ class PPOAgent:
 
 
 if __name__ == "__main__":
-    cfg = PPOConfig(rollout_steps=2048, minibatch_size=256, update_epochs=10)
-    bar_p = "data"
-    hour_p = "hour"
-    bar = pd.read_csv(bar_p)
-    hourly = pd.read_csv(hour_p)
+    cfg = PPOConfig()
 
-    df = align_hourly_regimes(bar,hourly,time_col="datetime")
-    feature_cols = []
-
-    X,close = df_to_arrays(df,feature_cols,close_col="close",dropna=True)
-    env_cfg = TradingEnvConfig(fee_bps=2.0,max_episode_steps=5000,random_start=True,seed=42)
+    bar = pd.read_csv("data/data_e.csv")
+    feature_cols = bar.columns.drop(["regime","timestamp","close_5m"]).tolist()
+    df = bar.copy()
+    spilt_idx = int(len(df) * 0.8)
+    df_train = df.iloc[:spilt_idx].copy()
+    df_test = df.iloc[spilt_idx:].copy()
+    X,close = df_to_arrays(df_train,feature_cols,close_col="close_5m",dropna=True)
+    env_cfg = TradingEnvConfig(fee_bps=0.2,hold_cost_bps=0.2,max_episode_steps=10000,random_start=True,seed=42)
     env = TradingEnv(X,close,env_cfg)
     agent = PPOAgent(env, cfg)
     agent.train(total_updates=200)
-    agent.save("ppo_policy.pt")
+    agent.save("model/ppo_policy.pt")
     print("Saved")
 
 
