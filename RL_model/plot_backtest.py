@@ -36,7 +36,7 @@ def plot_backtest_results(csv_path: str, save_dir: str = "plots", figsize=(15, 1
     
     # 创建图表
     fig = plt.figure(figsize=figsize)
-    gs = fig.add_gridspec(4, 2, hspace=0.3, wspace=0.3)
+    gs = fig.add_gridspec(5, 2, hspace=0.3, wspace=0.3)
     
     # 1. Equity Curve (权益曲线)
     ax1 = fig.add_subplot(gs[0, :])
@@ -134,6 +134,54 @@ def plot_backtest_results(csv_path: str, save_dir: str = "plots", figsize=(15, 1
     labels = [l.get_label() for l in lines]
     ax6.legend(lines, labels, loc='best')
     ax6.grid(True, alpha=0.3)
+    
+    # 7. Last 100 Time Points Position Example (最后100个时间点持仓示例)
+    ax7 = fig.add_subplot(gs[4, :])
+    ax7_twin = ax7.twinx()
+    
+    # 获取最后100个时间点
+    n_points = min(100, len(df))
+    df_last = df.tail(n_points).copy()
+    
+    # 价格曲线
+    line_price = ax7.plot(df_last['step'], df_last['close'], linewidth=1.5, 
+                         color='#1B998B', alpha=0.7, label='Price')
+    ax7.set_xlabel('Step', fontsize=11)
+    ax7.set_ylabel('Price', fontsize=11, color='#1B998B')
+    ax7.tick_params(axis='y', labelcolor='#1B998B')
+    
+    # 持仓（用不同颜色和形状表示）
+    colors_pos = ['#E63946' if p == -1 else '#06A77D' if p == 1 else '#F1A208' 
+                  for p in df_last['pos']]
+    markers_pos = ['v' if p == -1 else '^' if p == 1 else 'o' for p in df_last['pos']]
+    
+    for i, (step, pos, color, marker) in enumerate(zip(df_last['step'], df_last['pos'], 
+                                                         colors_pos, markers_pos)):
+        ax7_twin.scatter(step, pos, c=color, marker=marker, s=30, alpha=0.7, 
+                        edgecolors='black', linewidths=0.5)
+    
+    ax7_twin.set_ylabel('Position (-1/0/1)', fontsize=11, color='#E63946')
+    ax7_twin.tick_params(axis='y', labelcolor='#E63946')
+    ax7_twin.set_ylim(-1.5, 1.5)
+    ax7_twin.set_yticks([-1, 0, 1])
+    
+    ax7.set_title(f'Last {n_points} Time Points: Price & Positions (最后{n_points}个时间点: 价格和持仓)', 
+                 fontsize=12, fontweight='bold')
+    
+    # 添加图例
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Line2D([0], [0], color='#1B998B', linewidth=1.5, alpha=0.7, label='Price'),
+        Line2D([0], [0], marker='v', color='w', markerfacecolor='#E63946', 
+               markeredgecolor='black', markersize=8, markeredgewidth=0.5, label='Short (-1)'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#F1A208', 
+               markeredgecolor='black', markersize=8, markeredgewidth=0.5, label='Neutral (0)'),
+        Line2D([0], [0], marker='^', color='w', markerfacecolor='#06A77D', 
+               markeredgecolor='black', markersize=8, markeredgewidth=0.5, label='Long (1)')
+    ]
+    ax7.legend(handles=legend_elements, loc='upper left', fontsize=9)
+    ax7.grid(True, alpha=0.3)
     
     # 添加统计信息文本框
     total_return = (df['equity'].iloc[-1] / df['equity'].iloc[0] - 1) * 100

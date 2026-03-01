@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from ppo import (
+from ppo_train import (
     df_to_arrays,
     TradingEnv,
     TradingEnvConfig,
@@ -34,7 +34,9 @@ def backtest(agent: PPOAgent, env: TradingEnv, capital: float = 1.0) -> pd.DataF
     obs = env.reset()
     done = False
     rows = []
-    cum_reward = 0.0
+    equity = 1.0  # start with unit equity
+    cum_pnl_log = 0.0  # cumulative P&L in log space (for tracking)
+    cum_reward = 0.0   # cumulative reward (for tracking training signal)
     step = 0
 
     while not done:
@@ -42,23 +44,36 @@ def backtest(agent: PPOAgent, env: TradingEnv, capital: float = 1.0) -> pd.DataF
         next_obs, reward, done, info = env.step(action)
 
         t = int(info["t"])
+        
+        # Use real P&L for equity calculation (independent of reward design)
+        pnl_log = float(info.get("pnl_log", reward))  # fallback to reward if pnl_log not available
+        
+        # Update equity naturally: equity *= exp(pnl_log)
+        # This is the correct way to compound log returns
+        equity *= float(np.exp(pnl_log))
+        
+        # Track cumulative P&L in log space (for analysis/debugging)
+        cum_pnl_log += pnl_log
+        
+        # Track reward separately (for analysis)
         cum_reward += float(reward)
-        equity = float(np.exp(cum_reward))       
         nav = equity * float(capital)
 
         rows.append({
             "step": step,
             "t": t,
             "close": float(env.close[t]),
-            "ret_log": float(info["ret"]),
+            "ret_log": float(info["ret_next"]),
             "action": int(action),                 
             "pos": int(info["pos"]),           
             "turnover": float(info["turnover"]),
             "fee": float(info["fee"]),
             "hold_cost": float(info["hold_cost"]),
-            "reward": float(reward),
-            "cum_reward": float(cum_reward),
-            "equity": equity,
+            "pnl_log": pnl_log,              # real P&L for this step
+            "cum_pnl_log": cum_pnl_log,      # cumulative P&L
+            "reward": float(reward),         # training reward (may differ from P&L)
+            "cum_reward": float(cum_reward), # cumulative reward
+            "equity": equity,                 # equity based on real P&L
             "nav": nav,
         })
 
@@ -91,8 +106,11 @@ def summarize(steps: pd.DataFrame) -> dict:
 
 
 if __name__ == "__main__":
+    import sys
+    
     POLICY_PATH = "ppo_policy.pt"
-    TEST_CSV = "BTCUSDT_combined_klines_20210201_20260201_states4_labeled.csv"
+    # 默认使用测试数据，如果提供了参数则使用该参数
+    TEST_CSV = sys.argv[1] if len(sys.argv) > 1 else "test_data.csv"
     # 必须与训练时使用的特征列完全一致
     FEATURE_COLS = [
         "volume_5m", "log_ret_1_5m", "ema_ratio_9_21_5m",
@@ -111,9 +129,11 @@ if __name__ == "__main__":
     CAPITAL = 1.0
     OUT_CSV = "backtest_steps.csv"
 
+    print(f"正在读取测试数据: {TEST_CSV}")
     df_test = pd.read_csv(TEST_CSV)
     # 必须使用与训练时相同的 close_col
     X_test, close_test = df_to_arrays(df_test, FEATURE_COLS, close_col="close_5m", dropna=True)
+    print(f"测试数据: {len(X_test)} 条")
 
     env = TradingEnv(X_test, close_test, ENV_CFG)
 
@@ -125,8 +145,8 @@ if __name__ == "__main__":
     steps.to_csv(OUT_CSV, index=False)
 
     s = summarize(steps)
-    print("==== Backtest Summary ====")
+    print("\n==== Backtest Summary ====")
     for k, v in s.items():
         print(f"{k:>14s}: {v}")
 
-    print(f"Saved to: {OUT_CSV}")
+    print(f"\n回测结果已保存至: {OUT_CSV}")
