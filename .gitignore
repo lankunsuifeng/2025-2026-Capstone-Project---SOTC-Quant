@@ -32,3 +32,7 @@ RL_model/plots/*.png
 RL_model/ppo_policy.pt
 data/BTCUSDT_combined_klines_20210201_20260201_states4_labeled.csv
 data/data_e.csv
+
+# local artifacts
+*.pdf
+/plots/
