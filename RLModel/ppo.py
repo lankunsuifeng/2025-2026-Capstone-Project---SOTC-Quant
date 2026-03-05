@@ -46,6 +46,7 @@ class TradingEnvConfig:
     start_index: int = 1
     seed: int = 42
 
+
 class TradingEnv:
     def __init__(self,X,close,cfg = TradingEnvConfig()):
         assert isinstance(X,np.ndarray) and isinstance(close,np.ndarray)
@@ -56,7 +57,7 @@ class TradingEnv:
         self.X = X.astype(np.float32)
         self.close = close.astype(np.float32)
         self.cfg = cfg
-
+        self.regime = None
         self.fee = cfg.fee_bps / 1e4
         self.hold_cost = cfg.hold_cost_bps/1e4
         self.rng = np.random.default_rng(cfg.seed)
@@ -115,7 +116,8 @@ class TradingEnv:
             "fee":cost_fee,
             "hold_cost":cost_hold,
         }
-
+        if self.regime is not None:
+            info["regime"] = int(self.regime[next_t])
         return obs, float(reward), bool(done), info
     
 # PPO Agent:
