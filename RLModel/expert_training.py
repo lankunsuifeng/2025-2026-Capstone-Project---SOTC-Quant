@@ -124,18 +124,7 @@ def summarize_steps(steps: pd.DataFrame) -> Dict[str, float]:
 def score_summary(s:Dict[str,float]):
     return float(1.0*s["total_return"] + 0.1*s["sharpe"] + 2.0*s["mdd"] - 0.0001 * s["turnover_sum"])
 # Optuna Objective per regime expert
-def make_cfg_from_trial(trial:optuna.Trial) -> Tuple[TradingEnvConfig,PPOConfig]:
-    fee_bps = trial.suggest_float("fee_bps",0.0,2.0)
-    hold_cost_bps = trial.suggest_float("hold_cost_bps",0.0,2.0)
-    max_episode_steps = trial.suggest_int("max_episode_steps",2000,20000,step = 2000)
-    env_cfg = TradingEnvConfig(
-        fee_bps= fee_bps,
-        hold_cost_bps=hold_cost_bps,
-        max_episode_steps=max_episode_steps,
-        random_start=True,
-        seed = 42,
-        start_index=1
-    )
+def make_ppo_cfg_from_trial(trial: optuna.Trial) -> PPOConfig:
     cfg = PPOConfig()
     cfg.lr = trial.suggest_float("lr", 1e-5, 3e-3, log=True)
     cfg.gamma = trial.suggest_float("gamma", 0.90, 0.999)
@@ -150,7 +139,7 @@ def make_cfg_from_trial(trial:optuna.Trial) -> Tuple[TradingEnvConfig,PPOConfig]
     cfg.minibatch_size = trial.suggest_categorical("minibatch_size", [64, 128, 256])
     cfg.update_epochs = trial.suggest_int("update_epochs", 3, 10)
 
-    return env_cfg, cfg
+    return cfg
 class _FrozenTrial:
     def __init__(self, params: Dict[str, object]):
         self._params = params
@@ -163,11 +152,13 @@ class _FrozenTrial:
 
     def suggest_categorical(self, name, choices):
         return self._params[name]
-
+def make_ppo_cfg_from_params(params: Dict[str, object]) -> PPOConfig:
+    frozen = _FrozenTrial(params)
+    return make_ppo_cfg_from_trial(frozen)
 
 def train_one_expert(df_train,df_val,feature_cols:List[str],data_cfg,env_cfg,ppo_cfg,total_updates:int,seed:int = 42)-> Tuple[PPOAgent,Dict[str,float]]:
     X_train,close_train = df_to_arrays(df_train,feature_cols,close_col=data_cfg.close_col,dropna=True)
-    env_train = TradingEnv(X_train,close_train,env_cfg)
+    env_train = TradingEnv(X_train, close_train, env_cfg)
 
     torch.manual_seed(seed)
     np.random.seed(42)
@@ -186,6 +177,7 @@ def tune_expert_for_regime(
     df_val_all: pd.DataFrame,
     feature_cols: List[str],
     data_cfg: DataConfig,
+    fixed_env_cfg: TradingEnvConfig,
     n_trials: int = 25,
     total_updates: int = 120,
     study_dir: str = "result/optuna",
@@ -200,14 +192,14 @@ def tune_expert_for_regime(
         return {"regime": r, "skipped": True, "train_rows": len(df_train), "val_rows": len(df_val)}
 
     def objective(trial: optuna.Trial) -> float:
-        env_cfg, ppo_cfg = make_cfg_from_trial(trial)
+        ppo_cfg = make_ppo_cfg_from_trial(trial)
         # speed: fewer updates during search
         agent, summ = train_one_expert(
             df_train=df_train,
             df_val=df_val,
             feature_cols=feature_cols,
             data_cfg=data_cfg,
-            env_cfg=env_cfg,
+            env_cfg=fixed_env_cfg,
             ppo_cfg=ppo_cfg,
             total_updates=total_updates,
             seed=42,
@@ -223,13 +215,12 @@ def tune_expert_for_regime(
     best_params = dict(best.params)
     best_summary = best.user_attrs.get("summary", {})
 
-    best_env_cfg, best_ppo_cfg = make_cfg_from_trial(_FrozenTrial(best_params))
+    best_ppo_cfg = make_ppo_cfg_from_trial(_FrozenTrial(best_params))
     agent, val_summ = train_one_expert(
         df_train=df_train,
         df_val=df_val,
         feature_cols=feature_cols,
         data_cfg=data_cfg,
-        env_cfg=best_env_cfg,
         ppo_cfg=best_ppo_cfg,
         total_updates=max(total_updates, 200),
         seed=42,
@@ -245,7 +236,7 @@ def tune_expert_for_regime(
         "best_summary": best_summary,
         "final_val_summary": val_summ,
         "agent": agent,
-        "env_cfg": best_env_cfg,
+        "env_cfg": fixed_env_cfg,
         "ppo_cfg": best_ppo_cfg,
     }
 
@@ -255,18 +246,30 @@ def save_expert_bundle(
     out_root: str,
     r: int,
     agent: PPOAgent,
+    env_cfg: TradingEnvConfig,
     best_params: Dict[str, object],
     final_val_summary: Dict[str, float],
 ):
     d = os.path.join(out_root, f"regime_{r}")
     os.makedirs(d, exist_ok=True)
+
     model_path = os.path.join(d, "ppo_policy.pt")
     agent.save(model_path)
+
     meta = {
         "regime": r,
+        "fixed_env_cfg": {
+            "fee_bps": env_cfg.fee_bps,
+            "hold_cost_bps": env_cfg.hold_cost_bps,
+            "max_episode_steps": env_cfg.max_episode_steps,
+            "random_start": env_cfg.random_start,
+            "seed": env_cfg.seed,
+            "start_index": env_cfg.start_index,
+        },
         "best_params": best_params,
         "final_val_summary": final_val_summary,
     }
+
     with open(os.path.join(d, "best_params.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -280,22 +283,36 @@ def main():
         csv_path="data/data_e.csv",
         close_col="close_5m",
         regime_bool_cols=("state_0", "state_1", "state_2", "state_3"),
-        drop_cols=("timestamp","regime","close_5m", "state_0", "state_1", "state_2", "state_3"),
+        drop_cols=("timestamp", "regime", "close_5m", "state_0", "state_1", "state_2", "state_3"),
         train_ratio=0.8,
     )
+
     out_root = "model/experts"
     os.makedirs(out_root, exist_ok=True)
 
-    n_trials, search_updates = 25, 120
+    n_trials = 25
+    search_updates = 120
+
+    fixed_env_cfg = TradingEnvConfig(
+        fee_bps=0.5,
+        hold_cost_bps=0.1,
+        max_episode_steps=10000,
+        random_start=True,
+        seed=42,
+        start_index=1,
+    )
 
     df = pd.read_csv(data_cfg.csv_path)
     print("[check] state counts:", {c: int(df[c].astype(bool).sum()) for c in data_cfg.regime_bool_cols})
+
     feature_cols = build_feature_cols(df, data_cfg.drop_cols)
+
     df_train_all, df_test_all = train_test_split_df(df, data_cfg.train_ratio)
     df_val_all, df_holdout_all = train_test_split_df(df_test_all, 0.5)
     print(f"[data] train={len(df_train_all)} val={len(df_val_all)} holdout={len(df_holdout_all)}")
 
     all_results = {}
+
     for r in [0, 1, 2, 3]:
         print(f"\n========== TUNE expert regime={r} ==========")
         res = tune_expert_for_regime(
@@ -304,16 +321,19 @@ def main():
             df_val_all=df_val_all,
             feature_cols=feature_cols,
             data_cfg=data_cfg,
+            fixed_env_cfg=fixed_env_cfg,
             n_trials=n_trials,
             total_updates=search_updates,
             study_dir="result/optuna",
         )
         all_results[r] = res
+
         if not res.get("skipped", False):
             save_expert_bundle(
                 out_root=out_root,
                 r=r,
                 agent=res["agent"],
+                env_cfg=fixed_env_cfg,
                 best_params=res["best_params"],
                 final_val_summary=res["final_val_summary"],
             )
@@ -321,12 +341,24 @@ def main():
     summary = {}
     for r, res in all_results.items():
         if res.get("skipped", False):
-            summary[str(r)] = {"skipped": True, "train_rows": res["train_rows"], "val_rows": res["val_rows"]}
+            summary[str(r)] = {
+                "skipped": True,
+                "train_rows": res["train_rows"],
+                "val_rows": res["val_rows"],
+            }
         else:
             summary[str(r)] = {
                 "skipped": False,
                 "train_rows": res["train_rows"],
                 "val_rows": res["val_rows"],
+                "fixed_env_cfg": {
+                    "fee_bps": fixed_env_cfg.fee_bps,
+                    "hold_cost_bps": fixed_env_cfg.hold_cost_bps,
+                    "max_episode_steps": fixed_env_cfg.max_episode_steps,
+                    "random_start": fixed_env_cfg.random_start,
+                    "seed": fixed_env_cfg.seed,
+                    "start_index": fixed_env_cfg.start_index,
+                },
                 "study_best_value": res["study_best_value"],
                 "best_params": res["best_params"],
                 "final_val_summary": res["final_val_summary"],
@@ -335,6 +367,7 @@ def main():
     summary_path = os.path.join(out_root, "experts_summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
+
     print(f"[done] saved summary: {summary_path}")
 
 

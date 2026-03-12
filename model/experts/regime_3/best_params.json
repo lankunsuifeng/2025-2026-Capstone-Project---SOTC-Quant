@@ -1,0 +1,29 @@
+{
+  "regime": 3,
+  "best_params": {
+    "fee_bps": 1.4215445772428157,
+    "hold_cost_bps": 0.6427894818092929,
+    "max_episode_steps": 6000,
+    "lr": 0.000499489606036799,
+    "gamma": 0.9562016626853377,
+    "gae_lambda": 0.8894748869845948,
+    "clip_eps": 0.11390239363102872,
+    "ent_coef": 0.07560634226922446,
+    "vf_coef": 0.8390193842138476,
+    "max_grad_norm": 0.45558525089388013,
+    "hidden": 256,
+    "rollout_steps": 2048,
+    "minibatch_size": 128,
+    "update_epochs": 6
+  },
+  "final_val_summary": {
+    "bars": 3827,
+    "equity_end": 0.6962534789372675,
+    "total_return": -0.3037465210627325,
+    "mdd": -0.3848819454370359,
+    "sharpe": -0.019338366595203955,
+    "turnover_sum": 1143.0,
+    "fee_sum": 0.16248254517885385,
+    "hold_cost_sum": 0.17901687068388805
+  }
+}

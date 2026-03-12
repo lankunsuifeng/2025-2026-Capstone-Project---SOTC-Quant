@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 
-
+from dataclasses import dataclass
 from ppo import (
     df_to_arrays,
     TradingEnv,
@@ -15,13 +15,29 @@ from ppo import (
     PPOConfig,
 )
 
+@dataclass
+class PPOTestConfig:
+    agent_path:str
+    test_csv:str = "data/data_e.csv"
+    close_col: str = "close_5m"
+    drop_cols: tuple[str,...] = ("regime","timestamp","close_5m")
+    train_ratio: float = 0.8
+    use_test_split:bool = True
+    capital:float = 1.0
+    out_csv: str | None = "result/backtest_steps.csv"
+    plot_dir: str | None = None
+    plot_prefix:str = "ppo_test"
+    compare_buy_hold:bool = True
+    buy_hold_plot_name: str = "agent_vs_buyhold.png"
+
+
 def buy_and_hold(df_test: pd.DataFrame, close_col: str = "close_5m", capital: float = 1.0) -> pd.DataFrame:
     close = pd.to_numeric(df_test[close_col], errors="coerce").to_numpy(dtype=float)
     close = close[np.isfinite(close)]
     if len(close) < 2:
         return pd.DataFrame()
 
-    step_ret = close[1:] / np.maximum(close[:-1], 1e-12) - 1.0  # simple return per step
+    step_ret = close[1:] / np.maximum(close[:-1], 1e-12) - 1.0 
 
     equity = np.empty(len(step_ret) + 1, dtype=float)
     equity[0] = 1.0
@@ -37,6 +53,7 @@ def buy_and_hold(df_test: pd.DataFrame, close_col: str = "close_5m", capital: fl
         "nav": equity * float(capital),
     })
     return steps
+
 def max_drawdown(equity: np.ndarray) -> float:
     peak = equity[0]
     mdd = 0.0
@@ -52,8 +69,8 @@ def max_drawdown(equity: np.ndarray) -> float:
 def act_deterministic(agent: PPOAgent, obs_np: np.ndarray) -> int:
     obs = torch.tensor(obs_np, dtype=torch.float32, device=agent.device)
     logits, _ = agent.model(obs.unsqueeze(0))
-    act_idx = int(torch.argmax(logits, dim=-1).item())     # 0/1/2
-    return int(agent.IDX_TO_ACT[act_idx])                  # -1/0/1
+    act_idx = int(torch.argmax(logits, dim=-1).item())     
+    return int(agent.IDX_TO_ACT[act_idx])                  
 
 def backtest(agent: PPOAgent, env: TradingEnv, capital: float = 1.0) -> pd.DataFrame:
     obs = env.reset()
@@ -67,11 +84,11 @@ def backtest(agent: PPOAgent, env: TradingEnv, capital: float = 1.0) -> pd.DataF
         next_obs, reward, done, info = env.step(action)
 
         t = int(info["t"])
-        simple_ret = (env.close[t] + 1e-12) / (env.close[t-1] + 1e-12) - 1.0
-        pos = int(info["pos"])     # -1/0/1
+        simple_ret = float(info["ret"])
+        pos = int(info["pos"])     
         fee = float(info["fee"])
         hold = float(info["hold_cost"])
-        step_ret = pos * float(simple_ret) - fee - hold
+        step_ret = pos * simple_ret - fee - hold
         equity = (rows[-1]["equity"] if rows else 1.0) * (1.0 + step_ret)   
         nav = equity * float(capital)
 
@@ -248,66 +265,115 @@ def plot_backtest(steps: pd.DataFrame, out_dir: str = ".", prefix: str = "bt", s
     print(" ", f5)
     print(" ", f6)
 
-if __name__ == "__main__":
-    POLICY_PATH = "model/ppo_policy.pt"
-    TEST_CSV = "data/data_e.csv"         
-           
+# Build Test Env:
 
-    ENV_CFG = TradingEnvConfig(
-        fee_bps=0.1,
-        hold_cost_bps=0.1,
-        max_episode_steps=None,        
+def build_test_env(env_cfg,test_cfg):
+    df = pd.read_csv(test_cfg.test_csv)
+    if test_cfg.use_test_split:
+        split_idx = int(len(df)*test_cfg.train_ratio)
+        df = df.iloc[split_idx:].copy()
+    else:
+        df = df.copy()
+
+    feature_cols = df.columns.drop(list(test_cfg.drop_cols)).to_list()
+    X_test,close_test = df_to_arrays(df,feature_cols,close_col=test_cfg.close_col,dropna=True)
+    eval_env_cfg = TradingEnvConfig(
+        fee_bps=env_cfg.fee_bps,
+        hold_cost_bps=env_cfg.hold_cost_bps,
+        max_episode_steps=None,
+        random_start=False,
+        start_index=env_cfg.start_index,
+        seed=env_cfg.seed,
+    )
+    env = TradingEnv(X_test,close_test,eval_env_cfg)
+    return env,df
+
+
+def run_ppo_backtest(
+    agent_path: str,
+    env_cfg: TradingEnvConfig,
+    test_cfg: PPOTestConfig | None = None,
+) -> dict[str, Any]:
+    if test_cfg is None:
+        test_cfg = PPOTestConfig()
+
+    env, df_test = build_test_env(env_cfg, test_cfg)
+
+    agent = PPOAgent(env, PPOConfig())
+    agent.load(agent_path)
+
+    steps = backtest(agent, env, capital=test_cfg.capital)
+    summary = summarize(steps)
+
+    bh_steps = pd.DataFrame()
+    bh_summary: dict[str, float] = {}
+    if test_cfg.compare_buy_hold:
+        bh_steps = buy_and_hold(df_test, close_col=test_cfg.close_col, capital=test_cfg.capital)
+        bh_summary = summarize(bh_steps)
+
+    if test_cfg.out_csv:
+        os.makedirs(os.path.dirname(test_cfg.out_csv) or ".", exist_ok=True)
+        steps.to_csv(test_cfg.out_csv, index=False)
+
+    if test_cfg.plot_dir:
+        plot_backtest(steps, out_dir=test_cfg.plot_dir, prefix=test_cfg.plot_prefix, show=False)
+
+        if test_cfg.compare_buy_hold and len(bh_steps) > 0:
+            os.makedirs(test_cfg.plot_dir, exist_ok=True)
+            plt.figure()
+            plt.plot(steps["step"], steps["equity"], label="ppo_equity")
+            plt.plot(bh_steps["step"], bh_steps["equity"], label="buy_hold_equity")
+            plt.title("Equity Comparison")
+            plt.xlabel("step")
+            plt.ylabel("equity")
+            plt.legend()
+            compare_path = os.path.join(test_cfg.plot_dir, test_cfg.buy_hold_plot_name)
+            plt.savefig(compare_path, dpi=150, bbox_inches="tight")
+            plt.close()
+            print(f"Saved equity comparison to: {compare_path}")
+
+    return {
+        "steps": steps,
+        "summary": summary,
+        "buy_hold_steps": bh_steps,
+        "buy_hold_summary": bh_summary,
+    }
+
+
+if __name__ == "__main__":
+    policy_path = "model/ppo_policy.pt"
+
+    env_cfg = TradingEnvConfig(
+        fee_bps=2.5,
+        hold_cost_bps=2.5,
+        max_episode_steps=None,
         random_start=False,
         start_index=1,
         seed=42,
     )
-    CAPITAL = 10.0
-    OUT_CSV = "result/backtest_steps.csv"
 
-    df_test = pd.read_csv(TEST_CSV)
-    split_idx = int(len(df_test)*0.8)
-    df_test = df_test[split_idx:].copy()
-    FEATURE_COLS = df_test.columns.drop(["regime","timestamp","close_5m"]).tolist()
-    X_test, close_test = df_to_arrays(df_test, FEATURE_COLS, close_col="close_5m", dropna=True)
+    test_cfg = PPOTestConfig(
+        agent_path="model/ppo_policy.pt",
+        test_csv="data/data_e.csv",
+        close_col="close_5m",
+        drop_cols=("regime", "timestamp", "close_5m"),
+        train_ratio=0.8,
+        use_test_split=True,
+        capital=10.0,
+        out_csv="result/backtest_steps.csv",
+        plot_dir="plots",
+        plot_prefix="ppo_test",
+        compare_buy_hold=True,
+    )
 
-    env = TradingEnv(X_test, close_test, ENV_CFG)
-
-    cfg = PPOConfig()
-    agent = PPOAgent(env, cfg)
-    agent.load(POLICY_PATH)
-
-    steps = backtest(agent, env, capital=CAPITAL)
-    steps.to_csv(OUT_CSV, index=False)
-    PLOT_DIR = "plots"
-    plot_backtest(steps, out_dir=PLOT_DIR, prefix="ppo_test", show=False)
-    s = summarize(steps)
+    result = run_ppo_backtest(policy_path, env_cfg, test_cfg)
 
     print("==== Backtest Summary ====")
-    for k, v in s.items():
+    for k, v in result["summary"].items():
         print(f"{k:>14s}: {v}")
 
-    print(f"Saved to: {OUT_CSV}")
-
-
-    print("==== Buy&Hold Summary ====")
-    bh_steps = buy_and_hold(df_test, close_col="close_5m", capital=CAPITAL)
-    s_bh = summarize(bh_steps.rename(columns={"equity": "equity"}))  # summarize expects 'equity'
-    for k, v in s_bh.items():
-        print(f"{k:>14s}: {v}")
-    
-
-    # Plot equity comparison
-    os.makedirs(PLOT_DIR, exist_ok=True)
-    plt.figure()
-    plt.plot(steps["step"], steps["equity"], label="ppo_equity")
-    if len(bh_steps) > 0:
-        plt.plot(bh_steps["step"], bh_steps["equity"], label="buy_hold_equity")
-    plt.title("Equity Comparison")
-    plt.xlabel("step")
-    plt.ylabel("equity")
-    plt.legend()
-    plt.savefig(os.path.join(PLOT_DIR, "ppo_vs_buyhold_equity.png"), dpi=150, bbox_inches="tight")
-    plt.close()
-
-    print(f"Saved equity comparison to: {os.path.join(PLOT_DIR, 'ppo_vs_buyhold_equity.png')}")
+    if result["buy_hold_summary"]:
+        print("==== Buy&Hold Summary ====")
+        for k, v in result["buy_hold_summary"].items():
+            print(f"{k:>14s}: {v}")
 
