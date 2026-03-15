@@ -8,6 +8,7 @@ from ppo import PPOConfig,ActorCritic
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import pandas as pd
 
 @dataclass
 class MoERolloutBatch:
@@ -88,7 +89,7 @@ def save_moe_bundle(out_dir,agent,ppo_cfg,env_cfg = None,extra_meta = None):
     print(f"[save] moe metadata: {meta_path}")
     return ckpt_path
 
-def load_moe_bundle(bundle_path,agent,map_location):
+def load_moe_bundle(bundle_path,agent,map_location = None):
     ckpt = torch.load(bundle_path,map_location=map_location)
     expert_state_dicts = ckpt["expert_state_dicts"]
     if len(expert_state_dicts)!=len(agent.experts):
@@ -291,7 +292,7 @@ class MoERollingBuffer:
         self.returns[:] = self.advantages + self.values
         adv_mean = self.advantages.mean()
         adv_std = self.advantages.std()
-        self.advantages[:] = (self.advantages - adv_mean) / (adv_std+1e20)
+        self.advantages[:] = (self.advantages - adv_mean) / (adv_std+1e-12)
     def as_batch(self):
         if self.ptr != self.size:
             raise ValueError(f"Buffer not full, only export after full rollout")
@@ -307,7 +308,7 @@ class MoERollingBuffer:
 # Train experts(main code here)
 def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every = 10):
     agent.train_mode()
-    obs_dim = env.X.shape[0]
+    obs_dim = env.X.shape[1]
     obs_np = env.reset()
     obs = torch.tensor(obs_np,dtype=torch.float32,device = agent.device)
     history = {
@@ -354,7 +355,7 @@ def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every =
                 obs = obs,
                 act_idx=act_idx,
                 reward = torch.tensor(reward,dtype = torch.float32,device = agent.device),
-                done = torch.tensor(float(done),dtype = torch.float(32),device = agent.device),
+                done = torch.tensor(float(done),dtype = torch.float32,device = agent.device),
                 logprob=logprob,
                 value = value,
                 regime_id=regime_id,
@@ -404,6 +405,63 @@ def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every =
                 f"exp_counts={regime_counts.tolist()}"
             )
     return agent,history
+
+# BackTest
+
+@torch.no_grad()
+def backtest_moe(agent:HardMoEAgent,env,capital:float=1.0) -> pd.DataFrame:
+    agent.eval_mode()
+    obs_np = env.reset()
+    done = False
+    rows = []
+    cum_reward = 0.0
+    step = 0
+
+    while not done:
+        regime_id = get_current_regime(env)
+        obs = torch.tensor(obs_np,dtype = torch.float32,device=agent.device)
+        action,value_est = agent.act_deterministic(obs,regime_id)
+        next_obs_np,reward,done,info = env.step(action)
+
+        t = int(info["t"])
+        simple_ret = float(info["ret"])
+        pos = int(info["pos"])
+        fee = float(info["fee"])
+        hold = float(info["hold_cost"])
+        step_ret = pos*simple_ret - fee - hold
+        equity =(rows[-1]["equity"] if rows else 1.0)*(1.0 + step_ret)
+        nav = equity * float(capital)
+        cum_reward += float(reward)
+
+        row = {
+            "step":step,
+            "t":t,
+            "close":float(env.close[t]),
+            "ret":simple_ret,
+            "step_ret":float(step_ret),
+            "action":int(action),
+            "pos": pos,
+            "turnover": float(info["turnover"]),
+            "fee": fee,
+            "hold_cost": hold,
+            "reward": float(reward),
+            "cum_reward": float(cum_reward),
+            "equity": float(equity),
+            "nav": float(nav),
+            "regime_id": int(regime_id),
+            "expert_id": int(regime_id),
+            "value_est": float(value_est),
+        }
+        if "regime" in info:
+            row["next_regime_id"] = int(info["regime"])
+
+        rows.append(row)
+
+        obs_np = next_obs_np
+        step += 1
+
+    return pd.DataFrame(rows)
+
 
 if __name__ == "__main__":
     pass
