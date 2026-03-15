@@ -91,7 +91,8 @@ def backtest(agent: PPOAgent, env: TradingEnv, capital: float = 1.0) -> pd.DataF
         step_ret = pos * simple_ret - fee - hold
         equity = (rows[-1]["equity"] if rows else 1.0) * (1.0 + step_ret)   
         nav = equity * float(capital)
-
+        cum_reward += float(reward)
+        
         rows.append({
             "step": step,
             "step_ret": float(step_ret),

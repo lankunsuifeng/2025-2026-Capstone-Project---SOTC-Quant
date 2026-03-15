@@ -48,16 +48,21 @@ class TradingEnvConfig:
 
 
 class TradingEnv:
-    def __init__(self,X,close,cfg = TradingEnvConfig()):
+    def __init__(self,X,close,cfg = TradingEnvConfig(),regime_ids=None):
         assert isinstance(X,np.ndarray) and isinstance(close,np.ndarray)
         assert X.ndim == 2 and close.ndim == 1
         assert len(X) == len(close)
         assert cfg.start_index >= 1
+        
+        if regime_ids is not None:
+            regime_ids = np.asarray(regime_ids,dtype = np.int64)
+            assert regime_ids.ndim == 1
+            assert len(regime_ids) == len(close)
 
         self.X = X.astype(np.float32)
         self.close = close.astype(np.float32)
         self.cfg = cfg
-        self.regime = None
+        self.regime = regime_ids
         self.fee = cfg.fee_bps / 1e4
         self.hold_cost = cfg.hold_cost_bps/1e4
         self.rng = np.random.default_rng(cfg.seed)
@@ -70,16 +75,18 @@ class TradingEnv:
 
     def obs_dim(self)->int:
         return self.X.shape[1]
-    def reset(self)-> np.ndarray:
+    def reset(self) -> np.ndarray:
         self.pos = 0
         self.steps = 0
 
         if self.cfg.random_start and self.cfg.max_episode_steps is not None:
+            # Need at least one future bar for reward: t -> t+1
             max_start = self.T - self.cfg.max_episode_steps - 1
-            max_start = max(max_start,self.cfg.start_index)
-            self.episode_start = int(self.rng.integers(self.cfg.start_index,max_start+1))
+            max_start = max(max_start, self.cfg.start_index)
+            max_start = min(max_start, self.T - 2)
+            self.episode_start = int(self.rng.integers(self.cfg.start_index, max_start + 1))
         else:
-            self.episode_start = self.cfg.start_index
+            self.episode_start = min(self.cfg.start_index, self.T - 2)
 
         self.t = self.episode_start
         return self.X[self.t]
@@ -88,20 +95,23 @@ class TradingEnv:
 
         if action not in (-1,0,1):
             raise ValueError("Action Error")
+        
+        if self.t >= self.T - 1:
+            raise RuntimeError("No Future Data Available")
         new_pos = action
 
-        # Return
-        ret = np.log((self.close[self.t] + 1e-12) / (self.close[self.t-1] + 1e-12))
+        # Future Return
+        ret = (self.close[self.t+1] + 1e-15) / (self.close[self.t] + 1e-15) - 1.0
         turnover = abs(new_pos - self.pos)
         cost_fee = self.fee * turnover
         cost_hold = self.hold_cost * abs(new_pos)
         reward = new_pos * ret - cost_fee - cost_hold
-        reward = 1000 * reward
+        reward = 1000 * reward  #Scale
         self.pos = new_pos
         self.t += 1
         self.steps += 1
 
-        done = self.t >= self.T
+        done = self.t >= self.T-1
         if self.cfg.max_episode_steps is not None:
             done = done or (self.steps >= self.cfg.max_episode_steps)
         next_t = min(self.t, self.T - 1)
