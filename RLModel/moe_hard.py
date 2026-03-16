@@ -4,11 +4,13 @@ from dataclasses import dataclass,asdict,is_dataclass
 import numpy as np
 import json
 import os
-from ppo import PPOConfig,ActorCritic
+from ppo import PPOConfig, ActorCritic, TradingEnv, TradingEnvConfig
+from ppo_test import summarize, plot_backtest, buy_and_hold
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import pandas as pd
+import matplotlib.pyplot as plt
 
 @dataclass
 class MoERolloutBatch:
@@ -31,6 +33,30 @@ class MoEDataConfig:
 
 def build_regime_ids(df,regime_cols):
     return df.loc[:,regime_cols].to_numpy(dtype = np.float32).argmax(axis = 1).astype(np.int64)
+
+def _load_moe_data(bundle_path:str) -> dict:
+    meta_path = os.path.join(os.path.dirname(bundle_path),"moe_meta.json")
+    if not os.path.exists(meta_path):
+        return {}
+    with open(meta_path,"r") as f:
+        return json.load(f)
+    
+def _ppo_config_from_meta(meta:dict[str,Any])->PPOConfig:
+    cfg = PPOConfig()
+    for k,v in meta.get("ppo_cfg",{}).items():
+        if hasattr(cfg,k):
+            setattr(cfg,k,v)
+    return cfg
+
+def _prepare_moe_arrays(df,feature_cols,close_col,regime_cols):
+    use = df[feature_cols + [close_col] + list(regime_cols)].copy()
+    use = use.dropna().reset_index(drop = True)
+    X = use[feature_cols].to_numpy(dtype = np.float32)
+    close = use[close_col].to_numpy(dtype = np.float32)
+    regime_ids = (
+        use.loc[:,regime_cols].to_numpy(dtype = np.float32).argmax(axis = 1).astype(np.int64)
+    )
+    return X,close,regime_ids,use
 
 def get_current_regime(env)-> int:
     if env.regime is None:
@@ -322,11 +348,9 @@ def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every =
         "pi_loss": [],
         "v_loss": [],
         "entropy": [],
-        "expert_0_steps": [],
-        "expert_1_steps": [],
-        "expert_2_steps": [],
-        "expert_3_steps": [],
     }
+    for expert_id in range(agent.n_experts):
+        history[f"expert_{expert_id}_steps"] = []
     for upd in range(total_updates):
         buf = MoERollingBuffer(agent.cfg.rollout_steps,obs_dim,agent.device)
         r_sum = 0.0
@@ -462,7 +486,161 @@ def backtest_moe(agent:HardMoEAgent,env,capital:float=1.0) -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
+def run_moe_backtest(bundle_path,env_cfg,data_cfg = None,capital = 1.0,out_csv = None,plot_dir = None,plot_prefix = "moe_hard",compare_buy_hold = True):
+    if data_cfg is None:
+        data_cfg = MoEDataConfig()
+    meta = _load_moe_data(bundle_path)
+    ppo_cfg = _ppo_config_from_meta(meta)
+    n_experts = int(meta.get("n_experts",len(data_cfg.regime_cols)))
 
+    df = pd.read_csv(data_cfg.csv_path)
+    split_idx = int(len(df)*data_cfg.train_ratio)
+    df_test = df.iloc[split_idx:].copy()
+    feature_cols = df_test.columns.drop(list(data_cfg.drop_cols)).to_list()
+    X_test,close_test,regime_ids_test,df_test_used = _prepare_moe_arrays(df = df_test,feature_cols=feature_cols,close_col=data_cfg.close_col,regime_cols=data_cfg.regime_cols)
+
+    if len(regime_ids_test) != len(X_test):
+        regime_ids_test = regime_ids_test[-len(X_test):]
+    eval_env_cfg = TradingEnvConfig(
+        fee_bps=env_cfg.fee_bps,
+        hold_cost_bps=env_cfg.hold_cost_bps,
+        max_episode_steps=None,
+        random_start=False,
+        start_index=env_cfg.start_index,
+        seed=env_cfg.seed,
+    )
+    env = TradingEnv(X_test,close_test,eval_env_cfg,regime_ids=regime_ids_test)
+    agent = HardMoEAgent(obs_dims=env.X.shape[1],cfg=ppo_cfg,n_experts=n_experts)
+    load_moe_bundle(bundle_path,agent,map_location=agent.device)
+    steps = backtest_moe(agent,env,capital=capital)
+    summary = summarize(steps)
+    bh_steps = pd.DataFrame()
+    bh_summary = {}
+    if compare_buy_hold:
+        bh_steps = buy_and_hold(df_test_used,close_col=data_cfg.close_col,capital=capital)
+        bh_summary = summarize(bh_steps) if len(bh_steps)>0 else {}
+
+    if out_csv:
+        os.makedirs(os.path.dirname(out_csv) or ".",exist_ok=True)
+        steps.to_csv(out_csv,index=False)
+    if plot_dir:
+        plot_backtest(steps,out_dir=plot_dir,prefix=plot_prefix,show = False)
+        if compare_buy_hold and len(bh_steps) >0:
+            os.makedirs(plot_dir,exist_ok=True)
+            plt.figure()
+            plt.plot(steps["step"],steps["equity"],label = "moe_equity")
+            plt.plot(bh_steps["step"],bh_steps["equity"],label = "buy_hold_equity")
+            plt.title("Equity Comparison")
+            plt.xlabel("step")
+            plt.ylabel("equity")
+            plt.legend()
+            compare_path = os.path.join(plot_dir,f"{plot_prefix}_vs_buyhold.png")
+            plt.savefig(compare_path,dpi=150,bbox_inches = "tight")
+            plt.close()
+            print("Successfully Save Comparison Image")
+
+    return{
+        "steps":steps,
+        "summary":summary,
+        "buy_hold_steps":bh_steps,
+        "buy_hold_summary":bh_summary,
+    }
+
+
+    
 if __name__ == "__main__":
-    pass
+    data_cfg = MoEDataConfig(
+        csv_path="data/data_e.csv",
+        close_col="close_5m",
+        regime_cols=("state_0", "state_1", "state_2", "state_3"),
+        drop_cols=("timestamp", "regime", "close_5m", "state_0", "state_1", "state_2", "state_3"),
+        train_ratio=0.8,
+    )
+    ppo_cfg = PPOConfig()
+    env_cfg = TradingEnvConfig(
+        fee_bps=0.2,
+        hold_cost_bps=0.2,
+        max_episode_steps=10000,
+        random_start=True,
+        start_index=1,
+        seed=42,
+    )
+    model_dir = "model/moe_hard"
+    out_csv = "result/moe_backtest_steps.csv"
+    plot_dir = "plots"
+    plot_prefix = "moe_hard"
+    capital = 10.0
+    total_updates = 200
+    log_every = 10
+    df = pd.read_csv(data_cfg.csv_path)
+    split_idx = int(len(df) * data_cfg.train_ratio)
+    df_train = df.iloc[:split_idx].copy()
+    feature_cols = df_train.columns.drop(list(data_cfg.drop_cols)).tolist()
+    X_train, close_train, regime_ids_train, _ = _prepare_moe_arrays(
+        df=df_train,
+        feature_cols=feature_cols,
+        close_col=data_cfg.close_col,
+        regime_cols=data_cfg.regime_cols,
+    )
+
+    train_env = TradingEnv(
+        X_train,
+        close_train,
+        env_cfg,
+        regime_ids=regime_ids_train,
+    )
+
+    agent = HardMoEAgent(
+        obs_dims=train_env.X.shape[1],
+        cfg=ppo_cfg,
+        n_experts=len(data_cfg.regime_cols),
+    )
+
+    agent, history = train_moe_experts(
+        agent=agent,
+        env=train_env,
+        total_updates=total_updates,
+        log_every=log_every,
+    )
+
+    save_moe_bundle(
+        out_dir=model_dir,
+        agent=agent,
+        ppo_cfg=ppo_cfg,
+        env_cfg=env_cfg,
+        extra_meta={
+            "data_cfg": {
+                "csv_path": data_cfg.csv_path,
+                "close_col": data_cfg.close_col,
+                "regime_cols": list(data_cfg.regime_cols),
+                "drop_cols": list(data_cfg.drop_cols),
+                "train_ratio": data_cfg.train_ratio,
+            },
+            "train_rows": int(len(df_train)),
+            "total_updates": total_updates,
+        },
+    )
+
+    result = run_moe_backtest(
+        bundle_path=os.path.join(model_dir, "moe_experts.pt"),
+        env_cfg=env_cfg,
+        data_cfg=data_cfg,
+        capital=capital,
+        out_csv=out_csv,
+        plot_dir=plot_dir,
+        plot_prefix=plot_prefix,
+        compare_buy_hold=True,
+    )
+
+    print("==== MoE Backtest Summary ====")
+    for k, v in result["summary"].items():
+        print(f"{k:>14s}: {v}")
+
+    if result["buy_hold_summary"]:
+        print("==== Buy&Hold Summary ====")
+        for k, v in result["buy_hold_summary"].items():
+            print(f"{k:>14s}: {v}")
+
+    print(f"Saved MoE model to: {os.path.join(model_dir, 'moe_experts.pt')}")
+    print(f"Saved MoE backtest csv to: {out_csv}")
         

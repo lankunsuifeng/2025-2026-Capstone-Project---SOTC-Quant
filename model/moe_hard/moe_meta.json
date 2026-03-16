@@ -1,0 +1,49 @@
+{
+  "n_experts": 4,
+  "ppo_cfg": {
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_eps": 0.2,
+    "ent_coef": 0.1,
+    "vf_coef": 0.5,
+    "lr": 0.0003,
+    "max_grad_norm": 0.5,
+    "rollout_steps": 2048,
+    "minibatch_size": 256,
+    "update_epochs": 10,
+    "hidden": 128,
+    "device": "cpu"
+  },
+  "env_cfg": {
+    "fee_bps": 0.2,
+    "hold_cost_bps": 0.2,
+    "max_episode_steps": 10000,
+    "random_start": true,
+    "start_index": 1,
+    "seed": 42
+  },
+  "extra_meta": {
+    "data_cfg": {
+      "csv_path": "data/data_e.csv",
+      "close_col": "close_5m",
+      "regime_cols": [
+        "state_0",
+        "state_1",
+        "state_2",
+        "state_3"
+      ],
+      "drop_cols": [
+        "timestamp",
+        "regime",
+        "close_5m",
+        "state_0",
+        "state_1",
+        "state_2",
+        "state_3"
+      ],
+      "train_ratio": 0.8
+    },
+    "train_rows": 420536,
+    "total_updates": 200
+  }
+}

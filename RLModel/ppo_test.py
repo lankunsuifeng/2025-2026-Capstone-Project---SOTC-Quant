@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
-
+from typing import Any
 from dataclasses import dataclass
 from ppo import (
     df_to_arrays,
@@ -92,7 +92,7 @@ def backtest(agent: PPOAgent, env: TradingEnv, capital: float = 1.0) -> pd.DataF
         equity = (rows[-1]["equity"] if rows else 1.0) * (1.0 + step_ret)   
         nav = equity * float(capital)
         cum_reward += float(reward)
-        
+
         rows.append({
             "step": step,
             "step_ret": float(step_ret),
@@ -296,7 +296,7 @@ def run_ppo_backtest(
     test_cfg: PPOTestConfig | None = None,
 ) -> dict[str, Any]:
     if test_cfg is None:
-        test_cfg = PPOTestConfig()
+        test_cfg = PPOTestConfig(agent_path=agent_path)
 
     env, df_test = build_test_env(env_cfg, test_cfg)
 
