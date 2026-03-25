@@ -590,6 +590,6 @@ with st.expander("View Prediction Data"):
     st.download_button(
         label="Download predictions as CSV",
         data=csv,
-        file_name=f"predictions_{selected_data_file}",
+        file_name=f"lstm_viz_predictions_{selected_data_file}",
         mime="text/csv"
     )

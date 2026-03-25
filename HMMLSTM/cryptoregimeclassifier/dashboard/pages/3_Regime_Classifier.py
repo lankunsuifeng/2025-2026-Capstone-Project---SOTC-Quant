@@ -8,7 +8,13 @@ import joblib
 
 # add src path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from src.regime_label import get_hmm_features, train_hmm, map_states_to_regimes  # <- unify import
+from src.regime_label import (
+    fit_hmm_features,
+    transform_hmm_features,
+    train_hmm,
+    map_states_to_regimes,
+)
+from src.split_bounds import try_load_split_config
 
 DATA_FOLDER = "data/"
 MODELS_FOLDER = "models/"
@@ -50,6 +56,38 @@ hmm_features = st.multiselect(
 
 n_states = st.slider("Number of HMM states", min_value=2, max_value=8, value=4, step=1)
 
+# --- HMM fit cutoff (no leakage on later rows) ---
+st.subheader("HMM fit window (anti-leakage)")
+_ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+_min_d, _max_d = _ts.min().date(), _ts.max().date()
+st.caption(
+    "Scaler, PCA (if any), and HMM are **fit only** on rows with `timestamp.date` ≤ cutoff. "
+    "Labels are then predicted for **all** loaded rows. Use the latest date only if you accept full-sample fit."
+)
+_default_cutoff = _max_d
+_scfg = try_load_split_config()
+if _scfg and _scfg.get("hmm_fit_end"):
+    try:
+        _d = pd.Timestamp(_scfg["hmm_fit_end"])
+        if _d.tzinfo is None:
+            _d = _d.tz_localize("UTC")
+        else:
+            _d = _d.tz_convert("UTC")
+        _d_date = _d.date()
+        if _min_d <= _d_date <= _max_d:
+            _default_cutoff = _d_date
+    except (ValueError, TypeError):
+        pass
+train_cutoff = st.date_input(
+    "HMM fit end date (inclusive, by calendar day)",
+    value=_default_cutoff,
+    min_value=_min_d,
+    max_value=_max_d,
+    key="hmm_train_cutoff_date",
+)
+if _scfg and _scfg.get("hmm_fit_end"):
+    st.caption(f"Default from repo `split_config.json` **hmm_fit_end** (editable above).")
+
 # Dimensionality reduction options
 st.sidebar.subheader("Dimensionality Reduction")
 use_scaler = st.sidebar.checkbox("Scale (StandardScaler)", value=True)
@@ -85,6 +123,18 @@ if st.button("Train HMM and label"):
         st.stop()
 
     df_used = df.loc[valid_mask].copy()
+    df_used["timestamp"] = pd.to_datetime(df_used["timestamp"], utc=True, errors="coerce")
+    df_fit = df_used.loc[df_used["timestamp"].dt.date <= train_cutoff].copy()
+    if len(df_fit) < n_states * 5:
+        st.error(
+            f"Too few rows for HMM fit up to {train_cutoff}: {len(df_fit)} rows "
+            f"(need at least ~{n_states * 5} for n_states={n_states}). Choose a later cutoff."
+        )
+        st.stop()
+    st.info(
+        f"HMM fit rows: **{len(df_fit):,}** (≤ {train_cutoff}) · "
+        f"Label rows (full): **{len(df_used):,}**"
+    )
 
     # 创建进度显示容器
     progress_container = st.container()
@@ -106,31 +156,40 @@ if st.button("Train HMM and label"):
             status_text.text("📉 Step 2/5: Skipping dimensionality reduction (using raw features)...")
             progress_bar.progress(30)
         
-        X, scaler, reduction_model = get_hmm_features(
-            df_used, 
+        X_train, scaler, reduction_model, df_fit_clean = fit_hmm_features(
+            df_fit,
             feature_list=hmm_features,
             n_components=n_components,
-            scale=use_scaler, 
-            use_pca=use_pca
+            scale=use_scaler,
+            use_pca=use_pca,
         )
-        
+        X_all = transform_hmm_features(
+            df_used,
+            feature_list=hmm_features,
+            scaler=scaler,
+            reduction_model=reduction_model,
+            scale=use_scaler,
+            use_pca=use_pca,
+        )
+
         # Step 3: 训练HMM
         status_text.text("🎯 Step 3/5: Training HMM model (this may take a minute)...")
         progress_bar.progress(60)
-        
-        hmm_model = train_hmm(X, n_states=n_states, n_iter=200, random_state=42)
-        
+
+        hmm_model = train_hmm(X_train, n_states=n_states, n_iter=200, random_state=42)
+
         # Step 4: 生成标签
         status_text.text("🏷️ Step 4/5: Generating regime labels...")
         progress_bar.progress(80)
 
-        states = hmm_model.predict(X)
+        states_all = hmm_model.predict(X_all)
+        states_train = hmm_model.predict(X_train)
         labeled_df = df_used.copy()
-        labeled_df['state'] = states
+        labeled_df["state"] = states_all
 
-        # Map states → regimes using consistent columns (5m by default)
-        state_mapping = map_states_to_regimes(labeled_df, states, main_tf='5m')
-        labeled_df['regime'] = labeled_df['state'].map(state_mapping)
+        # Regime names from train-period stats only (no future rows in groupby)
+        state_mapping = map_states_to_regimes(df_fit_clean, states_train, main_tf="5m")
+        labeled_df["regime"] = labeled_df["state"].map(state_mapping)
 
         # Step 5: 保存到session
         status_text.text("💾 Step 5/5: Saving results...")
@@ -144,7 +203,10 @@ if st.button("Train HMM and label"):
         st.session_state['reduction_method'] = reduction_method
         st.session_state['hmm_features'] = hmm_features
         st.session_state['state_mapping'] = state_mapping
-        st.session_state['hmm_input_features'] = X  # <- keep the training matrix
+        st.session_state['hmm_input_features'] = X_all
+        st.session_state['hmm_train_features'] = X_train
+        st.session_state['hmm_fit_cutoff_date'] = str(train_cutoff)
+        st.session_state['hmm_fit_n_rows'] = len(df_fit_clean)
 
         # 完成
         progress_bar.progress(100)
@@ -169,17 +231,25 @@ if 'labeled_df' in st.session_state:
     hmm_model = st.session_state['hmm_model']
     state_mapping = st.session_state['state_mapping']
     hmm_features = st.session_state['hmm_features']
-    X_for_score = st.session_state.get('hmm_input_features', None)
+    X_for_score = st.session_state.get('hmm_train_features', None)
+    if X_for_score is None:
+        X_for_score = st.session_state.get('hmm_input_features', None)
 
     st.header("Model & Label Summary")
+    if st.session_state.get("hmm_fit_cutoff_date"):
+        st.markdown(
+            f"- HMM fit cutoff (inclusive date): **{st.session_state['hmm_fit_cutoff_date']}**  "
+            f"· rows used for fit (after NA drop): **{st.session_state.get('hmm_fit_n_rows', 'N/A')}**"
+        )
 
-    # log-likelihood, AIC, BIC (diag-cov GaussianHMM)
+    # log-likelihood, AIC, BIC (diag-cov GaussianHMM) on **train** matrix when available
     try:
         ll = float(hmm_model.score(X_for_score)) if X_for_score is not None else float('nan')
     except Exception:
         ll = float('nan')
 
     n_obs = int(X_for_score.shape[0]) if X_for_score is not None else len(labeled_df)
+    n_labeled_total = len(labeled_df)
     n_components = int(hmm_model.n_components)
     n_features = int(X_for_score.shape[1]) if X_for_score is not None else len(hmm_features)
 
@@ -201,7 +271,13 @@ if 'labeled_df' in st.session_state:
         'PCA': 'PCA'
     }.get(reduction_method, 'Unknown')
     
-    st.markdown(f"- Observations used: **{n_obs}**  \n- HMM states: **{n_components}**  \n- Reduction method: **{reduction_label}**  \n- Feature dims (after reduction): **{n_features}**")
+    st.markdown(
+        f"- Observations for likelihood/AIC/BIC (fit set): **{n_obs}**  \n"
+        f"- Rows labeled (full): **{n_labeled_total}**  \n"
+        f"- HMM states: **{n_components}**  \n"
+        f"- Reduction method: **{reduction_label}**  \n"
+        f"- Feature dims (after reduction): **{n_features}**"
+    )
 
     # state counts
     st.subheader("State counts and percentages")
@@ -235,11 +311,19 @@ if 'labeled_df' in st.session_state:
     else:
         st.write("No common interpretability features present for summary.")
 
-    # Save labeled data
+    # Save labeled data (HMM states + regime names)
     st.subheader("Save outputs")
-    save_name = selected_file.replace('_features.csv', f'_states{n_components}_labeled.csv')
+
+    def _feature_stem_for_hmm(fname: str) -> str:
+        if fname.endswith("_fe_features.csv"):
+            return fname[: -len("_fe_features.csv")]
+        if fname.endswith("_features.csv"):
+            return fname[: -len("_features.csv")]
+        return os.path.splitext(fname)[0]
+
+    save_name = f"{_feature_stem_for_hmm(selected_file)}_hmm_states{n_components}_labeled.csv"
     save_path = os.path.join(DATA_FOLDER, save_name)
-    if st.button(f"Save labeled CSV as `{save_name}`"):
+    if st.button(f"Save HMM-labeled CSV as `{save_name}`"):
         labeled_df.to_csv(save_path, index=False)
         st.success(f"Labeled data saved to `{save_path}`")
 
@@ -257,8 +341,11 @@ if 'labeled_df' in st.session_state:
             'state_mapping': st.session_state.get('state_mapping', {}),
             'n_states': n_components,
             'file_source': selected_file,
+            'hmm_fit_cutoff_date': st.session_state.get('hmm_fit_cutoff_date'),
+            'hmm_fit_n_rows': st.session_state.get('hmm_fit_n_rows'),
         }
-        model_name = f"hmm_{os.path.splitext(selected_file)[0]}_states{n_components}.joblib"
+        _hmm_stem = _feature_stem_for_hmm(selected_file)
+        model_name = f"hmm_{_hmm_stem}_states{n_components}.joblib"
         model_path = os.path.join(MODELS_FOLDER, model_name)
         joblib.dump(artifact, model_path)
         st.success(f"Saved model artifacts to {model_path}")

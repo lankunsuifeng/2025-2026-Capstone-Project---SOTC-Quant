@@ -26,6 +26,12 @@ Thumbs.db
 # Logs
 *.log
 
+# Model / binary artifacts (do not commit)
+*.joblib
+*.keras
+*.h5
+*.pkl
+
 # Large data files (too big for GitHub)
 RL_model/*.csv
 RL_model/backtest_steps.csv

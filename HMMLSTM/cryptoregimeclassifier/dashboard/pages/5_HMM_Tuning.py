@@ -233,7 +233,7 @@ if st.button("Run Grid Search", type="primary"):
         )
 
     # export
-    out_name = f"hmm_grid_{os.path.splitext(os.path.basename(selected_file))[0]}.csv"
+    out_name = f"hmm_tuning_bic_grid_{os.path.splitext(os.path.basename(selected_file))[0]}.csv"
     out_path = os.path.join(DATA_FOLDER, out_name)
     res.to_csv(out_path, index=False)
     st.info(f"Saved results to `{out_path}`")

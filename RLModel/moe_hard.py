@@ -6,11 +6,20 @@ import json
 import os
 from ppo import PPOConfig, ActorCritic, TradingEnv, TradingEnvConfig
 from ppo_test import summarize, plot_backtest, buy_and_hold
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import pandas as pd
-import matplotlib.pyplot as plt
+
+from split_bounds import (
+    effective_rl_test_start,
+    parse_split_bounds,
+    rl_test_mask,
+    rl_train_mask,
+    try_load_split_config,
+)
+
 
 @dataclass
 class MoERolloutBatch:
@@ -22,17 +31,127 @@ class MoERolloutBatch:
     regime_ids:torch.Tensor
 
 
+def _parse_cfg_timestamp(s: str | None) -> pd.Timestamp | None:
+    if s is None or (isinstance(s, str) and not str(s).strip()):
+        return None
+    ts = pd.Timestamp(s)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts
+
+
+def _timestamp_range_meta(df: pd.DataFrame, ts_col: str) -> dict[str, str | None]:
+    if ts_col not in df.columns or len(df) == 0:
+        return {"min": None, "max": None}
+    ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce").dropna()
+    if ts.empty:
+        return {"min": None, "max": None}
+    return {"min": ts.min().isoformat(), "max": ts.max().isoformat()}
+
+
 @dataclass
 class MoEDataConfig:
     csv_path:str = "data/data_e.csv"
     close_col:str = "close_5m"
     regime_cols:tuple[str,...] = ("state_0","state_1","state_2","state_3")
     drop_cols:tuple[str,...] = ("timestamp","regime","close_5m","state_0","state_1","state_2","state_3")
-    train_ratio:float = 0.8
+    train_ratio:float = 0.8  # fallback if split_config missing or time masks empty
+    split_config_path:str | None = None  # optional explicit path to split JSON
+    # Optional ISO-8601 UTC strings; only applied when split_config.json is used (with lstm_train_end / test_start).
+    rl_train_start: str | None = None  # if set: require ts >= this (still enforces ts > lstm_train_end)
+    rl_train_end: str | None = None  # if set: overrides split_config rl_train_end for the RL train window
 
 
 def build_regime_ids(df,regime_cols):
     return df.loc[:,regime_cols].to_numpy(dtype = np.float32).argmax(axis = 1).astype(np.int64)
+
+
+def moe_train_test_split(
+    df: pd.DataFrame,
+    data_cfg: MoEDataConfig,
+    ts_col: str = "timestamp",
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """
+    RL train: after LSTM cutoff, through rl_train_end, strictly before effective test start.
+    RL test: ts >= max(test_start, rl_train_end_effective) so evaluation never starts before RL train ends.
+
+    Optional ``MoEDataConfig.rl_train_start`` / ``rl_train_end`` tighten or override the calendar window
+    when split_config.json is present. Falls back to ``train_ratio`` if no config or empty masks.
+    """
+    meta: dict[str, Any] = {
+        "split_mode": "train_ratio",
+        "train_ratio": data_cfg.train_ratio,
+        "note": "No usable split_config (or missing timestamp column): calendar alignment vs LSTM/HMM not enforced.",
+    }
+    raw = try_load_split_config(data_cfg.split_config_path) if data_cfg.split_config_path else try_load_split_config()
+    if raw is not None and ts_col in df.columns:
+        try:
+            bounds = parse_split_bounds(raw)
+            lstm_end = bounds["lstm_train_end"]
+            rl_end_split = bounds["rl_train_end"]
+            test_start_cfg = bounds["test_start"]
+
+            rl_end_eff = _parse_cfg_timestamp(data_cfg.rl_train_end) or rl_end_split
+            bounds_use = {**bounds, "rl_train_end": rl_end_eff}
+            test_start_eff = effective_rl_test_start(bounds_use)
+
+            m_tr = rl_train_mask(df, bounds_use, ts_col=ts_col)
+            m_te = rl_test_mask(df, bounds_use, ts_col=ts_col)
+            if data_cfg.rl_train_start:
+                rs = _parse_cfg_timestamp(data_cfg.rl_train_start)
+                if rs is None:
+                    raise ValueError("MoEDataConfig.rl_train_start is not a valid timestamp")
+                ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+                m_tr = m_tr & (ts >= rs)
+
+            df_tr = df.loc[m_tr].copy()
+            df_te = df.loc[m_te].copy()
+            if len(df_tr) > 0 and len(df_te) > 0:
+                meta = {
+                    "split_mode": "split_config.json",
+                    "bounds_from_config": {k: str(v) for k, v in bounds.items()},
+                    "rl_window_effective": {
+                        "lstm_train_end": lstm_end.isoformat(),
+                        "rl_train_start_config": data_cfg.rl_train_start,
+                        "rl_train_start_applied": (
+                            _parse_cfg_timestamp(data_cfg.rl_train_start).isoformat()
+                            if data_cfg.rl_train_start
+                            else None
+                        ),
+                        "rl_train_end_from_split": rl_end_split.isoformat(),
+                        "rl_train_end_effective": rl_end_eff.isoformat(),
+                        "rl_train_end_overridden_by_moe_cfg": bool(data_cfg.rl_train_end),
+                        "test_start_from_split": test_start_cfg.isoformat(),
+                        "test_start_effective": test_start_eff.isoformat(),
+                        "test_start_effective_equals_max_of_test_start_and_rl_train_end": True,
+                    },
+                    "constraints_satisfied": {
+                        "rl_train_only_after_lstm_train_end": True,
+                        "rl_train_not_after_rl_train_end_effective": True,
+                        "rl_train_strictly_before_effective_test_start": True,
+                        "rl_test_not_before_rl_train_end_effective": True,
+                    },
+                    "train_rows": len(df_tr),
+                    "test_rows": len(df_te),
+                    "train_timestamp_range": _timestamp_range_meta(df_tr, ts_col),
+                    "test_timestamp_range": _timestamp_range_meta(df_te, ts_col),
+                }
+                if test_start_cfg < rl_end_eff:
+                    meta["warnings"] = [
+                        "split_config test_start is earlier than rl_train_end_effective; "
+                        "using test_start_effective = max(test_start, rl_train_end_effective) for RL test mask."
+                    ]
+                return df_tr, df_te, meta
+        except (KeyError, ValueError, TypeError):
+            pass
+    split_idx = int(len(df) * data_cfg.train_ratio)
+    df_tr = df.iloc[:split_idx].copy()
+    df_te = df.iloc[split_idx:].copy()
+    meta["train_timestamp_range"] = _timestamp_range_meta(df_tr, ts_col)
+    meta["test_timestamp_range"] = _timestamp_range_meta(df_te, ts_col)
+    return df_tr, df_te, meta
 
 def _load_moe_data(bundle_path:str) -> dict:
     meta_path = os.path.join(os.path.dirname(bundle_path),"moe_meta.json")
@@ -107,6 +226,9 @@ def save_moe_bundle(out_dir,agent,ppo_cfg,env_cfg = None,extra_meta = None):
         }
     if extra_meta:
         meta["extra_meta"] = extra_meta
+        sp = extra_meta.get("split")
+        if isinstance(sp, dict):
+            meta["train_test_split_meta"] = sp
 
     with open(meta_path,"w") as f:
         json.dump(meta,f,indent=2)
@@ -494,8 +616,7 @@ def run_moe_backtest(bundle_path,env_cfg,data_cfg = None,capital = 1.0,out_csv =
     n_experts = int(meta.get("n_experts",len(data_cfg.regime_cols)))
 
     df = pd.read_csv(data_cfg.csv_path)
-    split_idx = int(len(df)*data_cfg.train_ratio)
-    df_test = df.iloc[split_idx:].copy()
+    _, df_test, _ = moe_train_test_split(df, data_cfg)
     feature_cols = df_test.columns.drop(list(data_cfg.drop_cols)).to_list()
     X_test,close_test,regime_ids_test,df_test_used = _prepare_moe_arrays(df = df_test,feature_cols=feature_cols,close_col=data_cfg.close_col,regime_cols=data_cfg.regime_cols)
 
@@ -558,12 +679,12 @@ if __name__ == "__main__":
     )
     ppo_cfg = PPOConfig()
     env_cfg = TradingEnvConfig(
-        fee_bps=0.2,
+        fee_bps=5,
         hold_cost_bps=0.2,
         max_episode_steps=10000,
         random_start=True,
         start_index=1,
-        seed=42,
+        seed=56,
     )
     model_dir = "model/moe_hard"
     out_csv = "result/moe_backtest_steps.csv"
@@ -573,8 +694,7 @@ if __name__ == "__main__":
     total_updates = 200
     log_every = 10
     df = pd.read_csv(data_cfg.csv_path)
-    split_idx = int(len(df) * data_cfg.train_ratio)
-    df_train = df.iloc[:split_idx].copy()
+    df_train, _, split_meta = moe_train_test_split(df, data_cfg)
     feature_cols = df_train.columns.drop(list(data_cfg.drop_cols)).tolist()
     X_train, close_train, regime_ids_train, _ = _prepare_moe_arrays(
         df=df_train,
@@ -615,9 +735,13 @@ if __name__ == "__main__":
                 "regime_cols": list(data_cfg.regime_cols),
                 "drop_cols": list(data_cfg.drop_cols),
                 "train_ratio": data_cfg.train_ratio,
+                "split_config_path": data_cfg.split_config_path,
+                "rl_train_start": data_cfg.rl_train_start,
+                "rl_train_end": data_cfg.rl_train_end,
             },
             "train_rows": int(len(df_train)),
             "total_updates": total_updates,
+            "split": split_meta,
         },
     )
 

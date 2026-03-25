@@ -281,7 +281,7 @@ if selected_path:
         st.write("Columns:", features_df.columns.tolist())
 
         # Save result
-        out_name = os.path.splitext(os.path.basename(selected_path))[0] + "_features.csv"
+        out_name = os.path.splitext(os.path.basename(selected_path))[0] + "_fe_features.csv"
         out_path = os.path.join(DATA_FOLDER, out_name)
         features_df.to_csv(out_path, index=False)
         st.success(f"Saved features to `{out_name}` in the `data/` folder.")

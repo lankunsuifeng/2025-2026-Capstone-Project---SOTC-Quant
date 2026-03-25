@@ -14,6 +14,7 @@ import keras_tuner as kt
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from src.lstm_model import create_sequences
 from src.lstm_tuner import build_tuned_model
+from src.split_bounds import try_load_split_config, parse_split_bounds, lstm_train_mask
 
 DATA_FOLDER = 'data/'
 TUNER_FOLDER = 'tuner_logs/'
@@ -39,7 +40,7 @@ else:
     df = pd.read_csv(os.path.join(DATA_FOLDER, selected_file))
     
     # --- Data Preparation ---
-    regime_map = {label: i for i, label in enumerate(df['regime'].unique())}
+    regime_map = {label: i for i, label in enumerate(sorted(df['regime'].unique()))}
     num_classes = len(regime_map)
     df['target'] = df['regime'].map(regime_map)
     df['target'] = df['target'].shift(-1)
@@ -50,14 +51,40 @@ else:
     )]
     
     df.dropna(inplace=True)
+
+    st.sidebar.header("Split config")
+    _scfg6 = try_load_split_config()
+    _lim_lstm = st.sidebar.checkbox(
+        "Restrict to lstm_train_end (split_config.json)",
+        value=_scfg6 is not None,
+        disabled=_scfg6 is None,
+        key="lstm_tune_use_split_config",
+    )
+    if _scfg6 is None:
+        _lim_lstm = False
+    if _lim_lstm and "timestamp" not in df.columns:
+        st.sidebar.warning("No `timestamp` column; using full file for tuning.")
+        _lim_lstm = False
+    if _lim_lstm:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        _b6 = parse_split_bounds(_scfg6)
+        df = df.loc[lstm_train_mask(df, _b6)].copy()
+        st.info(
+            f"Tuning corpus: **{len(df):,}** rows (timestamp ≤ lstm_train_end per split_config.json)."
+        )
+
     X_raw = df[feature_cols]
     y_raw = df['target'].astype(int)
-    
-    # Train/Test Split
+
+    # Train/Test Split (only when not using global lstm cap; else use all rows for tuner)
     test_size = 0.2
-    train_n = int(len(df) * (1 - test_size))
-    X_train_raw, X_test_raw = X_raw.iloc[:train_n], X_raw.iloc[train_n:]
-    y_train_raw, y_test_raw = y_raw.iloc[:train_n], y_raw.iloc[train_n:]
+    if _lim_lstm:
+        X_train_raw = X_raw
+        y_train_raw = y_raw
+    else:
+        train_n = int(len(df) * (1 - test_size))
+        X_train_raw, X_test_raw = X_raw.iloc[:train_n], X_raw.iloc[train_n:]
+        y_train_raw, y_test_raw = y_raw.iloc[:train_n], y_raw.iloc[train_n:]
     
     # Scaling
     scaler = StandardScaler()
@@ -98,7 +125,8 @@ else:
                 X_train_seq, y_train_cat,
                 epochs=max_epochs,
                 validation_split=0.2,
-                callbacks=[stop_early]
+                callbacks=[stop_early],
+                shuffle=False,
             )
             st.session_state['lstm_tuner'] = tuner
 

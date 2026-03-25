@@ -6,62 +6,86 @@ from sklearn.decomposition import PCA
 from hmmlearn import hmm
 
 
+def fit_hmm_features(df, feature_list, n_components=None, scale=True,
+                     use_pca=True, use_autoencoder=False, autoencoder_epochs=100,
+                     progress_callback=None):
+    """
+    Fit StandardScaler and/or PCA on df only (train period). Drops rows with NA in feature_list.
+
+    Returns
+    -------
+    X : np.ndarray
+        Transformed feature matrix (rows aligned with df_aligned).
+    scaler : StandardScaler or None
+    reduction_model : PCA or None
+    df_aligned : pd.DataFrame
+        Subset of df with complete features; same row count as X (for regime naming on train only).
+    """
+    _ = (use_autoencoder, autoencoder_epochs, progress_callback)  # backward-compat unused
+
+    features = df[feature_list].copy()
+    mask = features.notna().all(axis=1)
+    if not mask.any():
+        raise ValueError("No rows with complete HMM features after NA filter (fit_hmm_features).")
+    df_aligned = df.loc[mask].copy()
+    feats = features.loc[mask]
+    X = feats.values.astype(np.float64)
+
+    scaler = None
+    if scale:
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X)
+
+    reduction_model = None
+    if use_pca:
+        if n_components is None:
+            n_components = min(X.shape[0], X.shape[1])
+        reduction_model = PCA(n_components=n_components, random_state=42)
+        X = reduction_model.fit_transform(X)
+
+    return X, scaler, reduction_model, df_aligned
+
+
+def transform_hmm_features(df, feature_list, scaler, reduction_model, scale=True, use_pca=True):
+    """
+    Apply a previously fitted scaler/PCA to all rows of df. Requires no NA in feature_list.
+    """
+    features = df[feature_list]
+    if not features.notna().all(axis=1).all():
+        raise ValueError(
+            "transform_hmm_features: missing values in HMM feature columns; "
+            "filter to complete rows before calling."
+        )
+    X = features.values.astype(np.float64)
+    if scale:
+        if scaler is None:
+            raise ValueError("scale=True but scaler is None")
+        X = scaler.transform(X)
+    if use_pca:
+        if reduction_model is None:
+            raise ValueError("use_pca=True but reduction_model is None")
+        X = reduction_model.transform(X)
+    return X
+
+
 def get_hmm_features(df, feature_list, n_components=None, scale=True,
                      use_pca=True, use_autoencoder=False, autoencoder_epochs=100,
                      progress_callback=None):
     """
-    Selects features, drops NA rows, scales, and (optionally) applies PCA.
-    
-    Parameters:
-    -----------
-    df : pd.DataFrame
-        输入数据框
-    feature_list : list
-        特征列名列表
-    n_components : int, optional
-        降维后的维度（PCA components）
-    scale : bool
-        是否标准化
-    use_pca : bool
-        是否使用PCA降维
-    use_autoencoder : bool
-        已废弃，保留此参数仅为向后兼容，实际不会使用
-    autoencoder_epochs : int
-        已废弃，保留此参数仅为向后兼容
-    progress_callback : callable, optional
-        已废弃，保留此参数仅为向后兼容
-    
-    Returns:
-    --------
-    X : np.array
-        降维后的特征矩阵
-    scaler : StandardScaler or None
-        标准化器
-    reduction_model : PCA or None
-        降维模型（PCA）
+    Backward-compatible: fit scaler/PCA on the entire df (same as old behavior — may leak if df includes future test period).
+
+    Returns (X, scaler, reduction_model) only — no df_aligned.
     """
-    features = df[feature_list].copy()
-    features = features.dropna(axis=0, how='any')
-
-    scaler = None
-    X = features.values
-
-    if scale:
-        scaler = StandardScaler()
-        X = scaler.fit_transform(features.values)
-
-    reduction_model = None
-
-    # 仅支持 PCA 或不降维
-    if use_pca:
-        if n_components is None:
-            # keep full rank if not specified
-            n_components = min(features.shape[0], features.shape[1])
-        reduction_model = PCA(n_components=n_components, random_state=42)
-        X = reduction_model.fit_transform(X)
-        # Optionally log variance explained (caller can print if needed)
-        # print(f"PCA explained variance ratio: {np.sum(reduction_model.explained_variance_ratio_):.4f}")
-
+    X, scaler, reduction_model, _ = fit_hmm_features(
+        df,
+        feature_list,
+        n_components=n_components,
+        scale=scale,
+        use_pca=use_pca,
+        use_autoencoder=use_autoencoder,
+        autoencoder_epochs=autoencoder_epochs,
+        progress_callback=progress_callback,
+    )
     return X, scaler, reduction_model
 
 def train_hmm(features, n_states=3, n_iter=150, random_state=42):
@@ -83,11 +107,15 @@ def map_states_to_regimes(df, labels, main_tf='5m'):
     Map HMM states -> interpretable regimes for the 6-state case:
       Squeeze, Range, Weak Trend, Strong Trend, Choppy High-Vol, Volatility Spike
     Uses ATR-normalized (volatility) and ADX (trend strength). Fully deterministic.
-    """
-    import numpy as np
-    import pandas as pd
 
+    For leak-free naming, pass only the train-period dataframe and train-period state labels
+    (same length, row-aligned), e.g. df_fit_clean and hmm_model.predict(X_train).
+    """
     df_labeled = df.copy()
+    if len(labels) != len(df_labeled):
+        raise ValueError(
+            f"map_states_to_regimes: len(labels)={len(labels)} != len(df)={len(df_labeled)}"
+        )
     df_labeled['state'] = labels
     n_states = int(len(np.unique(labels)))
 
