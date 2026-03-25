@@ -14,6 +14,12 @@ from ppo import (
     PPOAgent,
     PPOConfig,
 )
+from split_bounds import (
+    try_load_split_config,
+    parse_split_bounds,
+    effective_rl_test_start,
+    rl_test_mask,
+)
 
 @dataclass
 class PPOTestConfig:
@@ -22,6 +28,7 @@ class PPOTestConfig:
     close_col: str = "close_5m"
     drop_cols: tuple[str,...] = ("regime","timestamp","close_5m")
     train_ratio: float = 0.8
+    split_config_path: str | None = None  # optional explicit split_config.json path
     use_test_split:bool = True
     capital:float = 1.0
     out_csv: str | None = "result/backtest_steps.csv"
@@ -268,13 +275,59 @@ def plot_backtest(steps: pd.DataFrame, out_dir: str = ".", prefix: str = "bt", s
 
 # Build Test Env:
 
+def _timestamp_range_meta(df: pd.DataFrame, ts_col: str = "timestamp") -> dict[str, str | None]:
+    if ts_col not in df.columns or len(df) == 0:
+        return {"min": None, "max": None}
+    ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce").dropna()
+    if ts.empty:
+        return {"min": None, "max": None}
+    return {"min": ts.min().isoformat(), "max": ts.max().isoformat()}
+
+
+def _build_eval_split(df: pd.DataFrame, test_cfg: PPOTestConfig, ts_col: str = "timestamp") -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Prefer calendar split via split_config (same RL test window rule as MoE):
+      test = ts >= max(test_start, rl_train_end)
+    Fallback to ratio split when config/timestamp is unavailable.
+    """
+    if not test_cfg.use_test_split:
+        return df.copy(), {"split_mode": "full_dataset", "test_rows": len(df)}
+
+    raw = (
+        try_load_split_config(test_cfg.split_config_path)
+        if test_cfg.split_config_path
+        else try_load_split_config()
+    )
+    if raw is not None and ts_col in df.columns:
+        try:
+            bounds = parse_split_bounds(raw)
+            m_te = rl_test_mask(df, bounds, ts_col=ts_col)
+            df_te = df.loc[m_te].copy()
+            if len(df_te) > 0:
+                meta = {
+                    "split_mode": "split_config.json",
+                    "test_start_effective": effective_rl_test_start(bounds).isoformat(),
+                    "test_rows": len(df_te),
+                    "test_timestamp_range": _timestamp_range_meta(df_te, ts_col),
+                }
+                return df_te, meta
+        except (KeyError, ValueError, TypeError):
+            pass
+
+    split_idx = int(len(df) * test_cfg.train_ratio)
+    df_te = df.iloc[split_idx:].copy()
+    meta = {
+        "split_mode": "train_ratio_fallback",
+        "train_ratio": test_cfg.train_ratio,
+        "test_rows": len(df_te),
+        "test_timestamp_range": _timestamp_range_meta(df_te, ts_col),
+    }
+    return df_te, meta
+
 def build_test_env(env_cfg,test_cfg):
     df = pd.read_csv(test_cfg.test_csv)
-    if test_cfg.use_test_split:
-        split_idx = int(len(df)*test_cfg.train_ratio)
-        df = df.iloc[split_idx:].copy()
-    else:
-        df = df.copy()
+    df, split_meta = _build_eval_split(df, test_cfg, ts_col="timestamp")
+    print(f"[ppo_test] eval split meta: {split_meta}")
 
     feature_cols = df.columns.drop(list(test_cfg.drop_cols)).to_list()
     X_test,close_test = df_to_arrays(df,feature_cols,close_col=test_cfg.close_col,dropna=True)

@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 import os
+import json
+from pathlib import Path
 
 def data_insight(data: pd.DataFrame, close_col: str = "close_5m") -> dict:
     df = data.copy()
@@ -74,15 +76,32 @@ def data_insight(data: pd.DataFrame, close_col: str = "close_5m") -> dict:
 
     return out
 def data_engineering(
-    input_csv: str = "data/BTCUSDT_combined_klines_20210201_20260201_states4_labeled.csv",
+    input_csv: str = "data/BTCUSDT_combined_klines_20210201_20260201_hmm_states4_labeled_lstm_nextregime_ts32_predictions.csv",
     output_csv: str = "data/data_e.csv",
     close_col: str = "close_5m",
     state_col: str = "state",
+    hmm_pred_state_col: str = "hmm_predicted_state",
+    lstm_pred_state_col: str = "lstm_predicted_state",
+    pred_state_source: str = "lstm",  # "both" | "hmm" | "lstm"
     regime_col: str = "regime",
     timestamp_col: str = "timestamp",
     n_states: int = 4,
+    onehot_pred_states: bool = True,
+    write_split_meta: bool = True,
 ) -> pd.DataFrame:
     df = pd.read_csv(input_csv)
+    # --- drop bulky probability/confidence columns (keep predicted_state only) ---
+    drop_prob_cols = []
+    for c in df.columns:
+        if c == "lstm_prediction_confidence":
+            drop_prob_cols.append(c)
+        elif c.startswith("lstm_prob_"):
+            drop_prob_cols.append(c)
+        elif c.startswith("hmm_prob_"):
+            drop_prob_cols.append(c)
+    if drop_prob_cols:
+        df = df.drop(columns=drop_prob_cols)
+
     # --- build relative price features (avoid price level) ---
     # Use existing open/high/low if present; otherwise skip these features.
     if "open_5m" in df.columns:
@@ -96,6 +115,24 @@ def data_engineering(
         cats = list(range(n_states))
         state_oh = pd.get_dummies(pd.Categorical(df[state_col], categories=cats), prefix=state_col)
         df = pd.concat([df.drop(columns=[state_col]), state_oh], axis=1)
+
+    # --- include predicted states for RL target/features ---
+    _src = str(pred_state_source).strip().lower()
+    if _src not in {"both", "hmm", "lstm"}:
+        raise ValueError("pred_state_source must be one of: 'both', 'hmm', 'lstm'")
+
+    if _src == "hmm":
+        pred_state_cols = [c for c in [hmm_pred_state_col] if c in df.columns]
+    elif _src == "lstm":
+        pred_state_cols = [c for c in [lstm_pred_state_col] if c in df.columns]
+    else:
+        pred_state_cols = [c for c in [hmm_pred_state_col, lstm_pred_state_col] if c in df.columns]
+
+    if onehot_pred_states and pred_state_cols:
+        cats = list(range(n_states))
+        for c in pred_state_cols:
+            oh = pd.get_dummies(pd.Categorical(df[c], categories=cats), prefix=c)
+            df = pd.concat([df, oh], axis=1)
 
     # --- columns to keep (relative + existing indicators) ---
     preferred_feats = [
@@ -115,6 +152,11 @@ def data_engineering(
     ]
     # add one-hot cols if created
     preferred_feats += [c for c in df.columns if c.startswith(f"{state_col}_")]
+    if onehot_pred_states:
+        if _src in {"both", "hmm"}:
+            preferred_feats += [c for c in df.columns if c.startswith(f"{hmm_pred_state_col}_")]
+        if _src in {"both", "lstm"}:
+            preferred_feats += [c for c in df.columns if c.startswith(f"{lstm_pred_state_col}_")]
 
     # keep only those that exist
     feature_cols = [c for c in preferred_feats if c in df.columns]
@@ -129,12 +171,15 @@ def data_engineering(
     for c in [timestamp_col, regime_col, close_col]:
         if c in df.columns:
             keep.append(c)
+    # keep raw predicted_state columns too (useful as RL targets / debugging)
+    for c in pred_state_cols:
+        keep.append(c)
     keep += feature_cols
 
     out = df[keep].copy()
 
     # ensure numeric features are float32 where possible
-    for c in feature_cols + [close_col]:
+    for c in feature_cols + [close_col] + pred_state_cols:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
@@ -143,14 +188,60 @@ def data_engineering(
     # --- save ---
     os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     out.to_csv(output_csv, index=False)
+
+    if write_split_meta:
+        try:
+            from split_bounds import (
+                discover_split_config_path,
+                effective_rl_test_start,
+                load_split_config,
+                parse_split_bounds,
+            )
+
+            p = discover_split_config_path(Path(__file__).resolve().parent)
+            if p is not None:
+                meta = load_split_config(p)
+                meta_path = os.path.splitext(output_csv)[0] + "_split_meta.json"
+                os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
+                try:
+                    bounds = parse_split_bounds(meta)
+                    t_eff = effective_rl_test_start(bounds)
+                    meta = {
+                        **meta,
+                        "rl_alignment": {
+                            "bounds_utc_iso": {k: v.isoformat() for k, v in bounds.items()},
+                            "effective_test_start_utc_iso": t_eff.isoformat(),
+                            "effective_test_start_rule": "max(test_start, rl_train_end) — RL 回测不早于 rl_train_end",
+                            "rl_train_mask_rule": (
+                                "timestamp > lstm_train_end "
+                                "AND timestamp <= rl_train_end "
+                                "AND timestamp < effective_test_start"
+                            ),
+                            "rl_test_mask_rule": "timestamp >= effective_test_start",
+                            "moe_data_config_note": (
+                                "MoEDataConfig.rl_train_start / rl_train_end（可选，ISO UTC）在存在 split_config 时"
+                                "可进一步收紧或覆盖 RL 训练窗；见 RLModel/moe_hard.moe_train_test_split"
+                            ),
+                        },
+                    }
+                except (KeyError, ValueError, TypeError):
+                    pass
+                with open(meta_path, "w", encoding="utf-8") as fp:
+                    json.dump(meta, fp, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
     return out
 
 if __name__ == "__main__":
     df_e = data_engineering(
-        input_csv="data/BTCUSDT_combined_klines_20210201_20260201_states4_labeled.csv",
+        input_csv="data/BTCUSDT_combined_klines_20210201_20260201_hmm_states4_labeled_lstm_nextregime_ts32_predictions.csv",
         output_csv="data/data_e.csv",
         close_col="close_5m",
         state_col="state",
+        hmm_pred_state_col="hmm_predicted_state",
+        lstm_pred_state_col="lstm_predicted_state",
+        pred_state_source="both",
         regime_col="regime",
         timestamp_col="timestamp",
         n_states=4,
