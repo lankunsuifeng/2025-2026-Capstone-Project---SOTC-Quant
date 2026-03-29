@@ -38,6 +38,7 @@ from moe_hard import (
     HardMoEAgent,
     MoEDataConfig,
     _prepare_moe_arrays,
+    drop_cols_existing,
     moe_train_test_split,
     run_moe_backtest,
     save_moe_bundle,
@@ -74,7 +75,6 @@ def drop_cols_for_ppo_base(df: pd.DataFrame) -> tuple[str, ...]:
     """Exclude all regime / state signals from observations."""
     fixed = [
         "timestamp",
-        "regime",
         "close_5m",
         "hmm_predicted_state",
         "lstm_predicted_state",
@@ -95,7 +95,6 @@ def drop_cols_for_ppo_hmm(df: pd.DataFrame) -> tuple[str, ...]:
     """Tech + ``hmm_predicted_state_*``; drop LSTM columns."""
     fixed = [
         "timestamp",
-        "regime",
         "close_5m",
         "hmm_predicted_state",
         "lstm_predicted_state",
@@ -114,7 +113,6 @@ def drop_cols_for_ppo_hmm_lstm(df: pd.DataFrame) -> tuple[str, ...]:
     """Tech + ``hmm_predicted_state_*`` + ``lstm_predicted_state_*`` (raw scalars only dropped)."""
     fixed = [
         "timestamp",
-        "regime",
         "close_5m",
         "hmm_predicted_state",
         "lstm_predicted_state",
@@ -129,14 +127,13 @@ def drop_cols_for_ppo_hmm_lstm(df: pd.DataFrame) -> tuple[str, ...]:
 
 
 def moe_drop_cols_hmm() -> tuple[str, ...]:
-    return ("timestamp", "regime", "close_5m", *HMM_OH)
+    return ("timestamp", "close_5m", *HMM_OH)
 
 
 def moe_drop_cols_hmm_lstm(df: pd.DataFrame) -> tuple[str, ...]:
     """Observations: tech + ``hmm_predicted_state_*``; routing: LSTM one-hot (excluded from X)."""
     fixed = [
         "timestamp",
-        "regime",
         "close_5m",
         *LSTM_OH,
         "hmm_predicted_state",
@@ -226,7 +223,7 @@ class RunnerConfig:
     env_cfg: TradingEnvConfig = field(
         default_factory=lambda: TradingEnvConfig(
             fee_bps=5.0,
-            hold_cost_bps=0.0,
+            hold_cost_bps=0.1,
             max_episode_steps=10000,
             random_start=True,
             start_index=1,
@@ -237,7 +234,7 @@ class RunnerConfig:
     eval_env_cfg: TradingEnvConfig = field(
         default_factory=lambda: TradingEnvConfig(
             fee_bps=5.0,
-            hold_cost_bps=0.0,
+            hold_cost_bps=0.1,
             max_episode_steps=None,
             random_start=False,
             start_index=1,
@@ -461,7 +458,7 @@ def train_and_backtest_moe(
     data_cfg = _moe_data_cfg(exp_id, df, cfg.csv_path, cfg.train_ratio, cfg.split_config_path)
 
     df_train, df_test, split_meta = moe_train_test_split(df, data_cfg)
-    feature_cols = df_train.columns.drop(list(data_cfg.drop_cols)).tolist()
+    feature_cols = df_train.columns.drop(drop_cols_existing(df_train, data_cfg.drop_cols)).tolist()
     if cfg.close_col in feature_cols:
         feature_cols = [c for c in feature_cols if c != cfg.close_col]
 

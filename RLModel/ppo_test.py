@@ -29,7 +29,7 @@ class PPOTestConfig:
     agent_path:str
     test_csv:str = "data/data_e.csv"
     close_col: str = "close_5m"
-    drop_cols: tuple[str,...] = ("regime","timestamp","close_5m")
+    drop_cols: tuple[str, ...] = ("timestamp", "close_5m")
     train_ratio: float = 0.8
     split_config_path: str | None = None  # optional explicit split_config.json path
     use_test_split:bool = True
@@ -335,7 +335,8 @@ def build_test_env(env_cfg, test_cfg):
     df, split_meta = _build_eval_split(df, test_cfg, ts_col="timestamp")
     print(f"[ppo_test] eval split meta: {split_meta}")
 
-    feature_cols = df.columns.drop(list(test_cfg.drop_cols)).to_list()
+    _dc = [c for c in test_cfg.drop_cols if c in df.columns]
+    feature_cols = df.columns.drop(_dc).to_list()
     sub = df[feature_cols + [test_cfg.close_col]].copy()
     mask = sub.notna().all(axis=1)
     df_align = df.loc[mask].reset_index(drop=True)
@@ -428,7 +429,7 @@ if __name__ == "__main__":
         agent_path="model/ppo_policy.pt",
         test_csv="data/data_e.csv",
         close_col="close_5m",
-        drop_cols=("regime", "timestamp", "close_5m"),
+        drop_cols=("timestamp", "close_5m"),
         train_ratio=0.8,
         use_test_split=True,
         capital=10.0,

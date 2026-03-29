@@ -7,6 +7,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+try:
+    import joblib
+    from sklearn.preprocessing import RobustScaler
+except ImportError:  # optional until normalize_features=True
+    joblib = None  # type: ignore[misc, assignment]
+    RobustScaler = None  # type: ignore[misc, assignment]
+
 
 def _labels_to_state_ids(series: pd.Series, n_states: int) -> pd.Series:
     """
@@ -74,6 +81,213 @@ def _ensure_predicted_state_columns(
             df[lstm_pred_state_col] = _labels_to_state_ids(df[lstm_label_source_col], n_states)
             df = df.drop(columns=[lstm_label_source_col])
     return df
+
+
+def _continuous_rl_feature_cols(
+    feature_cols: list[str],
+    *,
+    hmm_pred_state_col: str,
+    lstm_pred_state_col: str,
+    onehot_pred_states: bool,
+    pred_state_source: str,
+) -> list[str]:
+    """Numeric indicators only; exclude HMM/LSTM one-hot columns (leave 0/1 as-is)."""
+    prefixes: list[str] = []
+    if onehot_pred_states:
+        _src = str(pred_state_source).strip().lower()
+        if _src in {"both", "hmm"}:
+            prefixes.append(f"{hmm_pred_state_col}_")
+        if _src in {"both", "lstm"}:
+            prefixes.append(f"{lstm_pred_state_col}_")
+    out: list[str] = []
+    for c in feature_cols:
+        if any(str(c).startswith(p) for p in prefixes):
+            continue
+        out.append(c)
+    return out
+
+
+def _robust_scaler_fit_mask(
+    df: pd.DataFrame,
+    *,
+    timestamp_col: str,
+    scaler_train_ratio: float,
+    split_config_path: str | None,
+) -> tuple[np.ndarray, str]:
+    """
+    Boolean mask (length ``len(df)``): rows used to fit RobustScaler.
+    Prefer ``split_config`` + ``rl_train_mask``; else first ``scaler_train_ratio`` fraction (row order).
+    """
+    from split_bounds import parse_split_bounds, rl_train_mask, try_load_split_config
+
+    raw = try_load_split_config(split_config_path) if split_config_path else try_load_split_config()
+    if raw is not None and timestamp_col in df.columns:
+        try:
+            bounds = parse_split_bounds(raw)
+            m = rl_train_mask(df, bounds, ts_col=timestamp_col).to_numpy(dtype=bool)
+            if bool(m.any()):
+                return m, "split_config.rl_train_mask"
+        except (KeyError, ValueError, TypeError) as e:
+            warnings.warn(
+                f"RobustScaler: split_config unusable ({e!r}); using scaler_train_ratio fallback on row order.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    n = len(df)
+    if n == 0:
+        return np.zeros(0, dtype=bool), "empty"
+    tr = float(scaler_train_ratio)
+    tr = min(max(tr, 1e-6), 1.0)
+    split_idx = max(1, int(n * tr))
+    mask = np.zeros(n, dtype=bool)
+    mask[:split_idx] = True
+    return mask, f"train_ratio_fallback(ratio={tr})"
+
+
+def _train_winsor_bounds(
+    out: pd.DataFrame,
+    continuous_cols: list[str],
+    mask_fit: np.ndarray,
+    *,
+    low_q: float,
+    high_q: float,
+) -> dict[str, tuple[float, float]]:
+    """Per-column (lo, hi) from quantiles on RL train rows only."""
+    low_q = float(low_q)
+    high_q = float(high_q)
+    if not (0.0 <= low_q < high_q <= 1.0):
+        raise ValueError("winsor quantiles require 0 <= low_q < high_q <= 1")
+    bounds: dict[str, tuple[float, float]] = {}
+    for c in continuous_cols:
+        if c not in out.columns:
+            continue
+        v = out.loc[mask_fit, c].to_numpy(dtype=np.float64)
+        v = v[np.isfinite(v)]
+        if v.size < 2:
+            continue
+        lo = float(np.quantile(v, low_q))
+        hi = float(np.quantile(v, high_q))
+        if lo > hi:
+            lo, hi = hi, lo
+        bounds[c] = (lo, hi)
+    return bounds
+
+
+def _apply_winsor_clip(out: pd.DataFrame, bounds: dict[str, tuple[float, float]]) -> None:
+    for c, (lo, hi) in bounds.items():
+        if c not in out.columns:
+            continue
+        arr = out[c].to_numpy(dtype=np.float64, copy=False)
+        out[c] = np.clip(arr, lo, hi).astype(np.float32)
+
+
+def _apply_rl_train_robust_scaler(
+    out: pd.DataFrame,
+    *,
+    continuous_cols: list[str],
+    timestamp_col: str,
+    scaler_train_ratio: float,
+    split_config_path: str | None,
+    robust_scaler_path: str,
+    fit_mask: np.ndarray | None = None,
+    fit_split_mode: str | None = None,
+) -> None:
+    if joblib is None or RobustScaler is None:
+        raise ImportError(
+            "normalize_features=True requires scikit-learn and joblib. "
+            "Install e.g. `pip install scikit-learn joblib`."
+        )
+    if not continuous_cols:
+        warnings.warn("RobustScaler: no continuous feature columns to scale; skipping.", UserWarning, stacklevel=2)
+        return
+
+    if fit_mask is None:
+        mask_fit, split_mode = _robust_scaler_fit_mask(
+            out,
+            timestamp_col=timestamp_col,
+            scaler_train_ratio=scaler_train_ratio,
+            split_config_path=split_config_path,
+        )
+    else:
+        mask_fit = np.asarray(fit_mask, dtype=bool)
+        split_mode = fit_split_mode or "provided"
+        if len(mask_fit) != len(out):
+            raise ValueError("fit_mask length must match out rows")
+
+    if not bool(mask_fit.any()):
+        warnings.warn("RobustScaler: fit mask is empty; skipping normalization.", UserWarning, stacklevel=2)
+        return
+
+    X_fit = out.loc[mask_fit, continuous_cols].to_numpy(dtype=np.float64, copy=True)
+    scaler = RobustScaler()
+    scaler.fit(X_fit)
+    X_all = out[continuous_cols].to_numpy(dtype=np.float64, copy=True)
+    out.loc[:, continuous_cols] = scaler.transform(X_all).astype(np.float32)
+
+    os.makedirs(os.path.dirname(robust_scaler_path) or ".", exist_ok=True)
+    joblib.dump(
+        {"scaler": scaler, "columns": list(continuous_cols), "kind": "RobustScaler"},
+        robust_scaler_path,
+    )
+    meta_path = os.path.splitext(robust_scaler_path)[0] + "_meta.json"
+    meta = {
+        "robust_scaler_path": robust_scaler_path,
+        "columns_scaled": list(continuous_cols),
+        "fit_mask_rule": split_mode,
+        "n_rows_fit": int(mask_fit.sum()),
+        "n_rows_total": int(len(out)),
+        "timestamp_col": timestamp_col,
+    }
+    with open(meta_path, "w", encoding="utf-8") as fp:
+        json.dump(meta, fp, indent=2, ensure_ascii=False)
+
+
+def _add_multi_horizon_features(
+    df: pd.DataFrame,
+    *,
+    close_col: str,
+    adx_col: str = "adx_5m",
+    vol_windows: tuple[int, ...] = (5, 20, 60),
+    bars_1h: int = 12,
+    bars_4h: int = 48,
+) -> list[str]:
+    """
+    Causal multi-horizon features (in-place). Returns list of column names added.
+
+    - Rolling log-return volatility over ``vol_windows`` bars.
+    - Cumulative simple returns over ``bars_1h`` / ``bars_4h`` bars (5m bars → 1h / 4h).
+    - ADX first difference as trend-strength slope (if ``adx_col`` present).
+    """
+    added: list[str] = []
+    if close_col not in df.columns:
+        return added
+
+    close = pd.to_numeric(df[close_col], errors="coerce").astype(np.float64)
+    prev = close.shift(1)
+    log_ret = np.log(np.where(prev > 0, close / prev, np.nan))
+
+    for w in vol_windows:
+        name = f"roll_vol_{w}_5m"
+        df[name] = pd.Series(log_ret, index=df.index).rolling(w, min_periods=w).std()
+        added.append(name)
+
+    name_1h = "cum_ret_1h_5m"
+    df[name_1h] = close.pct_change(periods=bars_1h)
+    added.append(name_1h)
+
+    name_4h = "cum_ret_4h_5m"
+    df[name_4h] = close.pct_change(periods=bars_4h)
+    added.append(name_4h)
+
+    if adx_col in df.columns:
+        adx = pd.to_numeric(df[adx_col], errors="coerce")
+        slope_name = "adx_slope_5m"
+        df[slope_name] = adx.diff(1)
+        added.append(slope_name)
+
+    return added
+
 
 def data_insight(data: pd.DataFrame, close_col: str = "close_5m") -> dict:
     df = data.copy()
@@ -154,7 +368,7 @@ def data_engineering(
     hmm_pred_state_col: str = "hmm_predicted_state",
     lstm_pred_state_col: str = "lstm_predicted_state",
     pred_state_source: str = "both",  # "both" | "hmm" | "lstm"
-    regime_col: str = "regime",
+    regime_col: str = "regime",  # ignored for output: RL uses HMM/LSTM one-hots only (no duplicate regime column)
     timestamp_col: str = "timestamp",
     n_states: int = 4,
     onehot_pred_states: bool = True,
@@ -162,6 +376,18 @@ def data_engineering(
     # HMMLSTM export: ``target`` = HMM next-bar class; ``lstm_predicted_regime`` = LSTM output
     hmm_label_source_col: str | None = "target",
     lstm_label_source_col: str | None = "lstm_predicted_regime",
+    # RobustScaler on continuous RL features: fit on RL train window, transform full series (like LSTM scaler).
+    normalize_features: bool = False,
+    robust_scaler_path: str | None = None,
+    scaler_train_ratio: float = 0.8,
+    normalization_split_config_path: str | None = None,
+    # Winsorize continuous features on RL train quantiles, clip full series (before RobustScaler).
+    winsorize_features: bool = False,
+    winsor_low_q: float = 0.01,
+    winsor_high_q: float = 0.99,
+    winsor_meta_path: str | None = None,
+    # Multi-horizon RL features: rolling vol (5/20/60), 1h/4h cum return (12/48 bars on 5m), ADX slope.
+    multi_horizon_features: bool = False,
 ) -> pd.DataFrame:
     df = pd.read_csv(input_csv)
     # --- drop bulky probability/confidence columns (keep predicted_state only) ---
@@ -194,7 +420,11 @@ def data_engineering(
         df["hl_range_norm_5m"] = (df["high_5m"] - df["low_5m"]) / (df[close_col] + 1e-12)
         df["log_hl_5m"] = np.log((df["high_5m"] + 1e-12) / (df["low_5m"] + 1e-12))
 
-    # Drop raw HMM latent ``state``; RL features use ``hmm_predicted_state_*`` / ``lstm_predicted_state_*`` only.
+    _mh_feat_cols: list[str] = []
+    if multi_horizon_features:
+        _mh_feat_cols = _add_multi_horizon_features(df, close_col=close_col)
+
+    # Drop raw HMM latent ``state``. RL uses regime **one-hot** columns only; scalars would duplicate *_0..n-1.
     if state_col in df.columns:
         df = df.drop(columns=[state_col])
 
@@ -232,6 +462,8 @@ def data_engineering(
         "hl_range_norm_5m",
         "log_hl_5m",
     ]
+    if multi_horizon_features:
+        preferred_feats += [c for c in _mh_feat_cols if c in df.columns]
     if onehot_pred_states:
         if _src in {"both", "hmm"}:
             preferred_feats += [c for c in df.columns if c.startswith(f"{hmm_pred_state_col}_")]
@@ -248,22 +480,92 @@ def data_engineering(
 
     # --- final column order ---
     keep = []
-    for c in [timestamp_col, regime_col, close_col]:
+    for c in [timestamp_col, close_col]:
         if c in df.columns:
             keep.append(c)
-    # keep raw predicted_state columns too (useful as RL targets / debugging)
+    # Omit scalar predicted_state if full one-hots exist (RL / MoE use *_0..n-1 only).
     for c in pred_state_cols:
+        if onehot_pred_states and all(f"{c}_{k}" in df.columns for k in range(n_states)):
+            continue
         keep.append(c)
     keep += feature_cols
 
     out = df[keep].copy()
 
     # ensure numeric features are float32 where possible
-    for c in feature_cols + [close_col] + pred_state_cols:
+    _num_cols = list(feature_cols) + [close_col]
+    for c in pred_state_cols:
+        if c in out.columns:
+            _num_cols.append(c)
+    for c in _num_cols:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
     out = out.dropna().reset_index(drop=True)
+
+    continuous_for_scale = _continuous_rl_feature_cols(
+        feature_cols,
+        hmm_pred_state_col=hmm_pred_state_col,
+        lstm_pred_state_col=lstm_pred_state_col,
+        onehot_pred_states=onehot_pred_states,
+        pred_state_source=_src,
+    )
+
+    need_fit_mask = (winsorize_features or normalize_features) and bool(continuous_for_scale)
+    fit_mask: np.ndarray | None = None
+    fit_split_mode = ""
+    if need_fit_mask:
+        fit_mask, fit_split_mode = _robust_scaler_fit_mask(
+            out,
+            timestamp_col=timestamp_col,
+            scaler_train_ratio=scaler_train_ratio,
+            split_config_path=normalization_split_config_path,
+        )
+
+    if winsorize_features:
+        if not continuous_for_scale:
+            warnings.warn("Winsorize: no continuous feature columns; skipping.", UserWarning, stacklevel=2)
+        elif fit_mask is None or not bool(fit_mask.any()):
+            warnings.warn("Winsorize: empty RL train mask; skipping.", UserWarning, stacklevel=2)
+        else:
+            wb = _train_winsor_bounds(
+                out,
+                continuous_for_scale,
+                fit_mask,
+                low_q=winsor_low_q,
+                high_q=winsor_high_q,
+            )
+            if not wb:
+                warnings.warn("Winsorize: no per-column bounds computed; skipping.", UserWarning, stacklevel=2)
+            else:
+                _apply_winsor_clip(out, wb)
+                wmeta_path = winsor_meta_path or (os.path.splitext(output_csv)[0] + "_winsor_meta.json")
+                os.makedirs(os.path.dirname(wmeta_path) or ".", exist_ok=True)
+                serial = {
+                    "fit_mask_rule": fit_split_mode,
+                    "n_rows_fit": int(fit_mask.sum()),
+                    "n_rows_total": int(len(out)),
+                    "winsor_low_q": float(winsor_low_q),
+                    "winsor_high_q": float(winsor_high_q),
+                    "columns": {
+                        c: {"clip_low": lo, "clip_high": hi} for c, (lo, hi) in sorted(wb.items())
+                    },
+                }
+                with open(wmeta_path, "w", encoding="utf-8") as fp:
+                    json.dump(serial, fp, indent=2, ensure_ascii=False)
+
+    if normalize_features:
+        rsp = robust_scaler_path or (os.path.splitext(output_csv)[0] + "_robust_scaler.joblib")
+        _apply_rl_train_robust_scaler(
+            out,
+            continuous_cols=continuous_for_scale,
+            timestamp_col=timestamp_col,
+            scaler_train_ratio=scaler_train_ratio,
+            split_config_path=normalization_split_config_path,
+            robust_scaler_path=rsp,
+            fit_mask=fit_mask if need_fit_mask else None,
+            fit_split_mode=fit_split_mode if need_fit_mask else None,
+        )
 
     # --- save ---
     os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
@@ -331,11 +633,18 @@ if __name__ == "__main__":
         hmm_pred_state_col="hmm_predicted_state",
         lstm_pred_state_col="lstm_predicted_state",
         pred_state_source="both",
-        regime_col="regime",
         timestamp_col="timestamp",
         n_states=4,
         hmm_label_source_col="target",
         lstm_label_source_col="lstm_predicted_regime",
+        # Winsorize (train 1%/99% → clip all rows) runs before RobustScaler when both True.
+        winsorize_features=True,
+        # winsorize_features=True → writes data/data_e_winsor_meta.json (default path)
+        # RobustScaler: fit on RL train window (split_config rl_train_mask, else row-order train_ratio)
+        normalize_features=True,
+        # normalize_features=True → data/data_e_robust_scaler.joblib + _robust_scaler_meta.json
+        multi_horizon_features=True
+        # multi_horizon_features=True → roll_vol_{5,20,60}_5m, cum_ret_1h/4h_5m, adx_slope_5m (if adx_5m exists)
     )
     print("Saved:", "data/data_e.csv", "shape:", df_e.shape)
     print("Columns:", df_e.columns.tolist())

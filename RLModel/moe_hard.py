@@ -58,7 +58,7 @@ class MoEDataConfig:
     csv_path:str = "data/data_e.csv"
     close_col:str = "close_5m"
     regime_cols:tuple[str,...] = ("hmm_predicted_state_0","hmm_predicted_state_1","hmm_predicted_state_2","hmm_predicted_state_3")
-    drop_cols:tuple[str,...] = ("timestamp","regime","close_5m","hmm_predicted_state_0","hmm_predicted_state_1","hmm_predicted_state_2","hmm_predicted_state_3")
+    drop_cols:tuple[str,...] = ("timestamp","close_5m","hmm_predicted_state_0","hmm_predicted_state_1","hmm_predicted_state_2","hmm_predicted_state_3")
     train_ratio:float = 0.8  # fallback if split_config missing or time masks empty
     split_config_path:str | None = None  # optional explicit path to split JSON
     # Optional ISO-8601 UTC strings; only applied when split_config.json is used (with lstm_train_end / test_start).
@@ -68,6 +68,11 @@ class MoEDataConfig:
 
 def build_regime_ids(df,regime_cols):
     return df.loc[:,regime_cols].to_numpy(dtype = np.float32).argmax(axis = 1).astype(np.int64)
+
+
+def drop_cols_existing(df: pd.DataFrame, drop_cols: tuple[str, ...]) -> list[str]:
+    """Subset of ``drop_cols`` present in ``df`` (avoids ``Index.drop`` KeyError if CSV omits optional columns)."""
+    return [c for c in drop_cols if c in df.columns]
 
 
 _HMM_PRED_OH: tuple[str, ...] = tuple(f"hmm_predicted_state_{i}" for i in range(4))
@@ -653,7 +658,7 @@ def run_moe_backtest(bundle_path,env_cfg,data_cfg = None,capital = 1.0,out_csv =
 
     df = pd.read_csv(data_cfg.csv_path)
     _, df_test, _ = moe_train_test_split(df, data_cfg)
-    feature_cols = df_test.columns.drop(list(data_cfg.drop_cols)).to_list()
+    feature_cols = df_test.columns.drop(drop_cols_existing(df_test, data_cfg.drop_cols)).to_list()
     X_test,close_test,regime_ids_test,df_test_used = _prepare_moe_arrays(df = df_test,feature_cols=feature_cols,close_col=data_cfg.close_col,regime_cols=data_cfg.regime_cols)
 
     if len(regime_ids_test) != len(X_test):
@@ -715,7 +720,7 @@ if __name__ == "__main__":
         csv_path="data/data_e.csv",
         close_col="close_5m",
         regime_cols=("hmm_predicted_state_0", "hmm_predicted_state_1", "hmm_predicted_state_2", "hmm_predicted_state_3"),
-        drop_cols=("timestamp", "regime", "close_5m", "hmm_predicted_state_0", "hmm_predicted_state_1", "hmm_predicted_state_2", "hmm_predicted_state_3"),
+        drop_cols=("timestamp", "close_5m", "hmm_predicted_state_0", "hmm_predicted_state_1", "hmm_predicted_state_2", "hmm_predicted_state_3"),
         train_ratio=0.8,
     )
     ppo_cfg = PPOConfig()
@@ -736,7 +741,7 @@ if __name__ == "__main__":
     log_every = 10
     df = pd.read_csv(data_cfg.csv_path)
     df_train, _, split_meta = moe_train_test_split(df, data_cfg)
-    feature_cols = df_train.columns.drop(list(data_cfg.drop_cols)).tolist()
+    feature_cols = df_train.columns.drop(drop_cols_existing(df_train, data_cfg.drop_cols)).tolist()
     X_train, close_train, regime_ids_train, _ = _prepare_moe_arrays(
         df=df_train,
         feature_cols=feature_cols,

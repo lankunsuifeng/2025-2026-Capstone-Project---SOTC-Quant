@@ -418,7 +418,8 @@ if __name__ == "__main__":
     cfg = PPOConfig()
 
     bar = pd.read_csv("data/data_e.csv")
-    feature_cols = bar.columns.drop(["regime","timestamp","close_5m"]).tolist()
+    _excl = [c for c in ("timestamp", "close_5m") if c in bar.columns]
+    feature_cols = bar.columns.drop(_excl).tolist()
     df = bar.copy()
     spilt_idx = int(len(df) * 0.8)
     df_train = df.iloc[:spilt_idx].copy()
