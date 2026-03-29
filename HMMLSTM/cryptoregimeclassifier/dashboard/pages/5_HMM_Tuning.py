@@ -12,6 +12,7 @@ from typing import List, Tuple
 
 # Add src path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from src.split_bounds import try_load_split_config
 
 st.set_page_config(page_title="HMM Hyperparameter Tuning", layout="wide")
 st.title("HMM Hyperparameter Tuning — Grid Search")
@@ -51,6 +52,20 @@ def prep_matrix(df: pd.DataFrame, cols: List[str]) -> Tuple[np.ndarray, np.ndarr
     mask = ~X.isna().any(axis=1)
     X_clean = X.loc[mask]
     return X_clean.values, X_clean.index.values
+
+
+def prep_matrix_chronological(df: pd.DataFrame, cols: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Same cleaning as prep_matrix, then sort by timestamp so train/val splits are time-ordered.
+    Requires ``timestamp`` column.
+    """
+    need = ["timestamp"] + list(cols)
+    sub = df[need].copy()
+    sub["timestamp"] = pd.to_datetime(sub["timestamp"], utc=True, errors="coerce")
+    sub[cols] = sub[cols].replace([np.inf, -np.inf], np.nan)
+    mask = sub["timestamp"].notna() & ~sub[cols].isna().any(axis=1)
+    sub = sub.loc[mask].sort_values("timestamp", kind="mergesort")
+    return sub[cols].values, sub["timestamp"].values
 
 def fit_scale_pca(Xtr: np.ndarray, Xva: np.ndarray, p_dim: int = None):
     scaler = StandardScaler().fit(Xtr)
@@ -141,21 +156,121 @@ else:
     pca_grid = [None]
 
 n_iter = st.sidebar.number_input("HMM n_iter", min_value=50, max_value=2000, value=200, step=50)
-train_frac = st.sidebar.slider("Train fraction (chronological)", 0.5, 0.95, 0.8, 0.05)
+
+# --- Train/val split: calendar (split_config) vs row fraction ---
+_ts_col_ok = "timestamp" in df.columns
+_split_cfg = try_load_split_config()
+if _ts_col_ok:
+    _ts_bounds = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dropna()
+    if len(_ts_bounds):
+        _min_d, _max_d = _ts_bounds.min().date(), _ts_bounds.max().date()
+    else:
+        _min_d = _max_d = pd.Timestamp.utcnow().date()
+else:
+    _min_d = _max_d = pd.Timestamp.utcnow().date()
+
+_use_cal_split = st.sidebar.checkbox(
+    "Use split_config.json (calendar: train ≤ cutoff, val after)",
+    value=bool(_split_cfg and _split_cfg.get("hmm_fit_end") and _ts_col_ok),
+    disabled=not _ts_col_ok,
+    help="Matches repo split_config **hmm_fit_end** (editable below). Fallback: train fraction.",
+)
+if not _ts_col_ok and _split_cfg is not None:
+    st.sidebar.caption("No `timestamp` column: using **train fraction** only.")
+
+_default_cutoff = _max_d
+if _split_cfg and _split_cfg.get("hmm_fit_end"):
+    try:
+        _d = pd.Timestamp(_split_cfg["hmm_fit_end"])
+        if _d.tzinfo is None:
+            _d = _d.tz_localize("UTC")
+        else:
+            _d = _d.tz_convert("UTC")
+        _d_date = _d.date()
+        if _min_d <= _d_date <= _max_d:
+            _default_cutoff = _d_date
+    except (ValueError, TypeError):
+        pass
+
+hmm_tuning_cutoff = st.sidebar.date_input(
+    "HMM fit end (inclusive calendar day) — train set",
+    value=_default_cutoff,
+    min_value=_min_d,
+    max_value=_max_d,
+    disabled=not _use_cal_split,
+    key="hmm_tuning_hmm_fit_end_date",
+)
+if _use_cal_split and _split_cfg and _split_cfg.get("hmm_fit_end"):
+    st.sidebar.caption("Default cutoff from repo **split_config.json** → `hmm_fit_end`.")
+
+train_frac = st.sidebar.slider(
+    "Train fraction (chronological, sorted by timestamp)",
+    0.5,
+    0.95,
+    0.8,
+    0.05,
+    disabled=_use_cal_split,
+)
 
 st.sidebar.caption("Tip: start small (K=2..4, diag, PCA 4–8). Validate regimes manually after top configs.")
 
 # ------- Run Grid Search -------
-def run_grid_search(df: pd.DataFrame, cols: List[str], k_min: int, k_max: int, cov_types: List[str], pca_grid: List[int], n_iter: int, train_frac: float):
-    X_all, idx_all = prep_matrix(df, cols)
+def run_grid_search(
+    df: pd.DataFrame,
+    cols: List[str],
+    k_min: int,
+    k_max: int,
+    cov_types: List[str],
+    pca_grid: List[int],
+    n_iter: int,
+    train_frac: float,
+    use_calendar_split: bool,
+    hmm_cutoff_date,
+):
+    if "timestamp" in df.columns:
+        X_all, ts_vals = prep_matrix_chronological(df, cols)
+    else:
+        X_all, _ = prep_matrix(df, cols)
+        ts_vals = None
+
     if X_all.size == 0:
         raise ValueError("After dropping NaNs/inf, no rows left.")
 
-    # chronological split
-    split_i = max(2, int(train_frac * len(X_all)))
-    Xtr_raw, Xva_raw = X_all[:split_i], X_all[split_i:]
-    if len(Xtr_raw) < 5 or len(Xva_raw) < 5:
-        raise ValueError("Train/validation split too small. Reduce features or lower train_frac.")
+    if use_calendar_split:
+        if ts_vals is None:
+            raise ValueError("Calendar split requires a `timestamp` column in the CSV.")
+        ts_ser = pd.to_datetime(pd.Series(ts_vals), utc=True)
+        dates = ts_ser.dt.date
+        train_mask = (dates <= hmm_cutoff_date).to_numpy(dtype=bool)
+        val_mask = (dates > hmm_cutoff_date).to_numpy(dtype=bool)
+        n_tr = int(np.sum(train_mask))
+        n_va = int(np.sum(val_mask))
+        if n_tr < 5 or n_va < 5:
+            raise ValueError(
+                f"Calendar split too small: train={n_tr}, val={n_va} (need ≥5 each). "
+                "Adjust cutoff or disable calendar split and use train fraction."
+            )
+        Xtr_raw, Xva_raw = X_all[train_mask], X_all[val_mask]
+    else:
+        split_i = max(2, int(train_frac * len(X_all)))
+        Xtr_raw, Xva_raw = X_all[:split_i], X_all[split_i:]
+        if len(Xtr_raw) < 5 or len(Xva_raw) < 5:
+            raise ValueError("Train/validation split too small. Reduce features or lower train_frac.")
+
+    if use_calendar_split:
+        st.info(
+            f"Train/val split: **calendar** — fit on rows with date ≤ `{hmm_cutoff_date}` "
+            f"({len(Xtr_raw):,} rows), validate on later rows ({len(Xva_raw):,} rows)."
+        )
+    else:
+        if ts_vals is not None:
+            split_desc = f"first **{train_frac:.0%}** of time-sorted rows"
+        else:
+            split_desc = f"first **{train_frac:.0%}** of rows (no `timestamp`; CSV row order)"
+        st.info(
+            f"Train/val split: **fraction** — {split_desc} = train "
+            f"({len(Xtr_raw):,} train / {len(Xva_raw):,} val)."
+        )
 
     combos = [(K, cov, p_dim) for K in range(k_min, k_max+1) for cov in cov_types for p_dim in pca_grid]
     rows = []
@@ -203,7 +318,7 @@ def run_grid_search(df: pd.DataFrame, cols: List[str], k_min: int, k_max: int, c
             # robust: record failure and continue
             rows.append({
                 "K": K, "cov": cov, "pca_dim": (p_dim or None),
-                "train_rows": len(Xtr_raw[:split_i]) if 'Xtr_raw' in locals() else 0,
+                "train_rows": len(Xtr_raw) if "Xtr_raw" in locals() else 0,
                 "val_rows": len(Xva_raw) if 'Xva_raw' in locals() else 0,
                 "train_ll_per_row": -1e99, "val_ll_per_row": -1e99, "train_BIC": 1e99,
                 "err": str(e)
@@ -217,7 +332,18 @@ def run_grid_search(df: pd.DataFrame, cols: List[str], k_min: int, k_max: int, c
 
 if st.button("Run Grid Search", type="primary"):
     try:
-        res = run_grid_search(df, chosen_features, k_min, k_max, cov_types, pca_grid, n_iter, train_frac)
+        res = run_grid_search(
+            df,
+            chosen_features,
+            k_min,
+            k_max,
+            cov_types,
+            pca_grid,
+            n_iter,
+            train_frac,
+            use_calendar_split=bool(_use_cal_split and _ts_col_ok),
+            hmm_cutoff_date=hmm_tuning_cutoff,
+        )
     except Exception as e:
         st.error(f"Grid search failed: {e}")
         st.stop()

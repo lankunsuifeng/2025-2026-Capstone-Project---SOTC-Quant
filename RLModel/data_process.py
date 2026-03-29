@@ -1,8 +1,79 @@
-import pandas as pd
-import numpy as np
-import os
 import json
+import os
+import re
+import warnings
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+def _labels_to_state_ids(series: pd.Series, n_states: int) -> pd.Series:
+    """
+    Map LSTM/HMM label column to integer class ids in ``0 .. n_states-1``.
+
+    Accepts: integers/floats, numeric strings, ``State_k`` / ``state_k`` (from LSTM export).
+    Unparseable values become NaN.
+    """
+    out = np.full(len(series), np.nan, dtype=np.float64)
+    idx = series.index
+    for j, v in enumerate(series):
+        if pd.isna(v):
+            continue
+        if isinstance(v, (bool, np.bool_)):
+            continue
+        if isinstance(v, (np.integer, int)):
+            out[j] = int(v)
+            continue
+        if isinstance(v, (np.floating, float)):
+            if np.isfinite(v):
+                out[j] = int(round(v))
+            continue
+        s = str(v).strip()
+        if s.isdigit():
+            out[j] = int(s)
+            continue
+        m = re.match(r"(?i)^state_?(\d+)$", s)
+        if m:
+            out[j] = int(m.group(1))
+            continue
+        m = re.search(r"_(\d+)\s*$", s)
+        if m:
+            out[j] = int(m.group(1))
+            continue
+    ser = pd.Series(out, index=idx)
+    ser = ser.where(ser.isna() | ((ser >= 0) & (ser < n_states)), np.nan)
+    return ser
+
+
+def _ensure_predicted_state_columns(
+    df: pd.DataFrame,
+    hmm_pred_state_col: str,
+    lstm_pred_state_col: str,
+    n_states: int,
+    hmm_label_source_col: str | None,
+    lstm_label_source_col: str | None,
+) -> pd.DataFrame:
+    """
+    If canonical columns are missing, build them from HMMLSTM export conventions:
+
+    - ``target`` → next-bar HMM regime class (same semantics as training target on page 4)
+    - ``lstm_predicted_regime`` → LSTM predicted regime string or id
+    """
+    df = df.copy()
+    if hmm_label_source_col and hmm_label_source_col in df.columns:
+        if hmm_pred_state_col in df.columns:
+            df = df.drop(columns=[hmm_label_source_col])
+        else:
+            df[hmm_pred_state_col] = _labels_to_state_ids(df[hmm_label_source_col], n_states)
+            df = df.drop(columns=[hmm_label_source_col])
+    if lstm_label_source_col and lstm_label_source_col in df.columns:
+        if lstm_pred_state_col in df.columns:
+            df = df.drop(columns=[lstm_label_source_col])
+        else:
+            df[lstm_pred_state_col] = _labels_to_state_ids(df[lstm_label_source_col], n_states)
+            df = df.drop(columns=[lstm_label_source_col])
+    return df
 
 def data_insight(data: pd.DataFrame, close_col: str = "close_5m") -> dict:
     df = data.copy()
@@ -82,12 +153,15 @@ def data_engineering(
     state_col: str = "state",
     hmm_pred_state_col: str = "hmm_predicted_state",
     lstm_pred_state_col: str = "lstm_predicted_state",
-    pred_state_source: str = "lstm",  # "both" | "hmm" | "lstm"
+    pred_state_source: str = "both",  # "both" | "hmm" | "lstm"
     regime_col: str = "regime",
     timestamp_col: str = "timestamp",
     n_states: int = 4,
     onehot_pred_states: bool = True,
     write_split_meta: bool = True,
+    # HMMLSTM export: ``target`` = HMM next-bar class; ``lstm_predicted_regime`` = LSTM output
+    hmm_label_source_col: str | None = "target",
+    lstm_label_source_col: str | None = "lstm_predicted_regime",
 ) -> pd.DataFrame:
     df = pd.read_csv(input_csv)
     # --- drop bulky probability/confidence columns (keep predicted_state only) ---
@@ -102,6 +176,16 @@ def data_engineering(
     if drop_prob_cols:
         df = df.drop(columns=drop_prob_cols)
 
+    # --- align HMMLSTM column names → hmm_predicted_state / lstm_predicted_state ---
+    df = _ensure_predicted_state_columns(
+        df,
+        hmm_pred_state_col=hmm_pred_state_col,
+        lstm_pred_state_col=lstm_pred_state_col,
+        n_states=n_states,
+        hmm_label_source_col=hmm_label_source_col,
+        lstm_label_source_col=lstm_label_source_col,
+    )
+
     # --- build relative price features (avoid price level) ---
     # Use existing open/high/low if present; otherwise skip these features.
     if "open_5m" in df.columns:
@@ -110,11 +194,9 @@ def data_engineering(
         df["hl_range_norm_5m"] = (df["high_5m"] - df["low_5m"]) / (df[close_col] + 1e-12)
         df["log_hl_5m"] = np.log((df["high_5m"] + 1e-12) / (df["low_5m"] + 1e-12))
 
-    # --- one-hot for state ---
+    # Drop raw HMM latent ``state``; RL features use ``hmm_predicted_state_*`` / ``lstm_predicted_state_*`` only.
     if state_col in df.columns:
-        cats = list(range(n_states))
-        state_oh = pd.get_dummies(pd.Categorical(df[state_col], categories=cats), prefix=state_col)
-        df = pd.concat([df.drop(columns=[state_col]), state_oh], axis=1)
+        df = df.drop(columns=[state_col])
 
     # --- include predicted states for RL target/features ---
     _src = str(pred_state_source).strip().lower()
@@ -150,8 +232,6 @@ def data_engineering(
         "hl_range_norm_5m",
         "log_hl_5m",
     ]
-    # add one-hot cols if created
-    preferred_feats += [c for c in df.columns if c.startswith(f"{state_col}_")]
     if onehot_pred_states:
         if _src in {"both", "hmm"}:
             preferred_feats += [c for c in df.columns if c.startswith(f"{hmm_pred_state_col}_")]
@@ -224,12 +304,21 @@ def data_engineering(
                             ),
                         },
                     }
-                except (KeyError, ValueError, TypeError):
-                    pass
+                except (KeyError, ValueError, TypeError) as e:
+                    warnings.warn(
+                        f"data_engineering: could not parse split bounds for rl_alignment in sidecar JSON ({e!r}); "
+                        f"writing raw split_config only to {meta_path}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
                 with open(meta_path, "w", encoding="utf-8") as fp:
                     json.dump(meta, fp, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.warn(
+                f"data_engineering: failed to write split meta sidecar ({e!r}).",
+                UserWarning,
+                stacklevel=2,
+            )
 
     return out
 
@@ -245,6 +334,8 @@ if __name__ == "__main__":
         regime_col="regime",
         timestamp_col="timestamp",
         n_states=4,
+        hmm_label_source_col="target",
+        lstm_label_source_col="lstm_predicted_regime",
     )
     print("Saved:", "data/data_e.csv", "shape:", df_e.shape)
     print("Columns:", df_e.columns.tolist())

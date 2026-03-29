@@ -178,12 +178,13 @@ progress_bar.progress(1.0)
 
 # Create prediction dataframe
 pred_df = df.iloc[time_steps:].copy().reset_index(drop=True)
-pred_df['predicted_regime'] = predictions
-pred_df['prediction_confidence'] = [max(probs) for probs in probabilities_list]
+# Column names aligned with page 4_Model_Training export (lstm_* prefix)
+pred_df["lstm_predicted_regime"] = predictions
+pred_df["lstm_prediction_confidence"] = [max(probs) for probs in probabilities_list]
 
 # Add probability columns for each regime
 for regime_name, class_id in regime_map.items():
-    pred_df[f'prob_{regime_name}'] = [probs[int(class_id)] for probs in probabilities_list]
+    pred_df[f"lstm_prob_{regime_name}"] = [probs[int(class_id)] for probs in probabilities_list]
 
 st.success(f"Generated {len(predictions):,} predictions")
 
@@ -255,7 +256,7 @@ with st.expander("🔍 Debug: Available Columns", expanded=False):
 if has_ground_truth:
     # Prepare ground truth and predictions for evaluation
     y_true = pred_df[ground_truth_col].dropna()
-    y_pred = pred_df['predicted_regime']
+    y_pred = pred_df["lstm_predicted_regime"]
     
     # Align indices
     common_idx = y_true.index.intersection(y_pred.index)
@@ -400,27 +401,27 @@ else:
     
     with col1:
         st.metric("Total Predictions", f"{len(predictions):,}")
-        st.metric("Unique Regimes Predicted", f"{pred_df['predicted_regime'].nunique()}")
+        st.metric("Unique Regimes Predicted", f"{pred_df['lstm_predicted_regime'].nunique()}")
         # Prediction stability: how often regime changes
-        regime_changes = (pred_df['predicted_regime'] != pred_df['predicted_regime'].shift()).sum()
+        regime_changes = (pred_df["lstm_predicted_regime"] != pred_df["lstm_predicted_regime"].shift()).sum()
         stability_ratio = 1 - (regime_changes / len(pred_df))
         st.metric("Prediction Stability", f"{stability_ratio:.4f}")
     
     with col2:
-        avg_confidence = pred_df['prediction_confidence'].mean()
+        avg_confidence = pred_df["lstm_prediction_confidence"].mean()
         st.metric("Average Confidence", f"{avg_confidence:.4f}")
-        median_confidence = pred_df['prediction_confidence'].median()
+        median_confidence = pred_df["lstm_prediction_confidence"].median()
         st.metric("Median Confidence", f"{median_confidence:.4f}")
-        std_confidence = pred_df['prediction_confidence'].std()
+        std_confidence = pred_df["lstm_prediction_confidence"].std()
         st.metric("Confidence Std Dev", f"{std_confidence:.4f}")
     
     with col3:
-        min_confidence = pred_df['prediction_confidence'].min()
+        min_confidence = pred_df["lstm_prediction_confidence"].min()
         st.metric("Min Confidence", f"{min_confidence:.4f}")
-        max_confidence = pred_df['prediction_confidence'].max()
+        max_confidence = pred_df["lstm_prediction_confidence"].max()
         st.metric("Max Confidence", f"{max_confidence:.4f}")
         # Calculate entropy of predictions (uncertainty measure)
-        regime_counts = pred_df['predicted_regime'].value_counts()
+        regime_counts = pred_df["lstm_predicted_regime"].value_counts()
         probs = regime_counts / len(pred_df)
         entropy = -np.sum(probs * np.log(probs + 1e-10))
         normalized_entropy = entropy / np.log(len(regime_counts)) if len(regime_counts) > 1 else 0
@@ -433,7 +434,7 @@ else:
     # Calculate statistics for each regime's probability
     prob_stats = {}
     for regime_name in regime_map.keys():
-        prob_col = f'prob_{regime_name}'
+        prob_col = f"lstm_prob_{regime_name}"
         if prob_col in pred_df.columns:
             prob_stats[regime_name] = {
                 'mean': pred_df[prob_col].mean(),
@@ -460,7 +461,7 @@ if not price_cols:
 price_col = price_cols[0]  # Use first available price column
 
 # Create color map for regimes
-unique_regimes = sorted(pred_df['predicted_regime'].unique())
+unique_regimes = sorted(pred_df["lstm_predicted_regime"].unique())
 colors = plt.cm.tab10(np.linspace(0, 1, len(unique_regimes)))
 regime_colors = {regime: colors[i] for i, regime in enumerate(unique_regimes)}
 
@@ -471,7 +472,7 @@ fig, ax = plt.subplots(figsize=(16, 8))
 pred_df_sorted = pred_df.sort_values('timestamp').reset_index(drop=True)
 
 # Find continuous regime segments (where regime changes)
-regime_changes = (pred_df_sorted['predicted_regime'] != pred_df_sorted['predicted_regime'].shift()).cumsum()
+regime_changes = (pred_df_sorted["lstm_predicted_regime"] != pred_df_sorted["lstm_predicted_regime"].shift()).cumsum()
 
 # Get y-axis limits first (will be set by price plot)
 y_min = pred_df_sorted[price_col].min() * 0.98
@@ -485,7 +486,7 @@ for segment_id in regime_changes.unique():
     if segment_df.empty:
         continue
     
-    regime = segment_df['predicted_regime'].iloc[0]
+    regime = segment_df["lstm_predicted_regime"].iloc[0]
     color = regime_colors.get(regime, 'gray')
     
     # Get the time range for this continuous segment
@@ -529,7 +530,7 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("Regime Distribution")
-    regime_counts = pred_df['predicted_regime'].value_counts()
+    regime_counts = pred_df["lstm_predicted_regime"].value_counts()
     fig2, ax2 = plt.subplots(figsize=(8, 6))
     colors_list = [regime_colors.get(regime, 'gray') for regime in regime_counts.index]
     ax2.pie(regime_counts.values, labels=regime_counts.index, autopct='%1.1f%%', 
@@ -539,7 +540,7 @@ with col1:
 
 with col2:
     st.subheader("Average Confidence by Regime")
-    avg_confidence = pred_df.groupby('predicted_regime')['prediction_confidence'].mean().sort_values(ascending=False)
+    avg_confidence = pred_df.groupby("lstm_predicted_regime")["lstm_prediction_confidence"].mean().sort_values(ascending=False)
     fig3, ax3 = plt.subplots(figsize=(8, 6))
     colors_list = [regime_colors.get(regime, 'gray') for regime in avg_confidence.index]
     ax3.barh(avg_confidence.index, avg_confidence.values, color=colors_list)
@@ -556,8 +557,8 @@ if show_probabilities:
     fig4, ax4 = plt.subplots(figsize=(16, 6))
     
     for regime_name in regime_map.keys():
-        if f'prob_{regime_name}' in pred_df.columns:
-            ax4.plot(pred_df['timestamp'], pred_df[f'prob_{regime_name}'], 
+        if f"lstm_prob_{regime_name}" in pred_df.columns:
+            ax4.plot(pred_df["timestamp"], pred_df[f"lstm_prob_{regime_name}"], 
                     label=regime_name, alpha=0.7, linewidth=1.5)
     
     ax4.set_xlabel('Time', fontsize=12)
@@ -578,9 +579,13 @@ if show_probabilities:
 # Data Table
 # -------------------------------------------------------------------
 with st.expander("View Prediction Data"):
-    display_cols = ['timestamp', price_col, 'predicted_regime', 'prediction_confidence']
+    display_cols = ["timestamp", price_col, "lstm_predicted_regime", "lstm_prediction_confidence"]
     if show_probabilities:
-        prob_cols = [f'prob_{regime}' for regime in regime_map.keys() if f'prob_{regime}' in pred_df.columns]
+        prob_cols = [
+            f"lstm_prob_{regime}"
+            for regime in regime_map.keys()
+            if f"lstm_prob_{regime}" in pred_df.columns
+        ]
         display_cols.extend(prob_cols)
     
     st.dataframe(pred_df[display_cols].tail(100), use_container_width=True)

@@ -21,6 +21,9 @@ from split_bounds import (
     rl_test_mask,
 )
 
+# HMM predicted-state one-hots (same naming as data_process / experiment_runner)
+_HMM_PRED_OH: tuple[str, ...] = tuple(f"hmm_predicted_state_{i}" for i in range(4))
+
 @dataclass
 class PPOTestConfig:
     agent_path:str
@@ -100,14 +103,14 @@ def backtest(agent: PPOAgent, env: TradingEnv, capital: float = 1.0) -> pd.DataF
         nav = equity * float(capital)
         cum_reward += float(reward)
 
-        rows.append({
+        row = {
             "step": step,
             "step_ret": float(step_ret),
             "t": t,
             "close": float(env.close[t]),
             "ret": float(info["ret"]),
-            "action": int(action),                 
-            "pos": int(info["pos"]),           
+            "action": int(action),
+            "pos": int(info["pos"]),
             "turnover": float(info["turnover"]),
             "fee": float(info["fee"]),
             "hold_cost": float(info["hold_cost"]),
@@ -115,7 +118,10 @@ def backtest(agent: PPOAgent, env: TradingEnv, capital: float = 1.0) -> pd.DataF
             "cum_reward": float(cum_reward),
             "equity": equity,
             "nav": nav,
-        })
+        }
+        if "regime" in info:
+            row["hmm_regime_id"] = int(info["regime"])
+        rows.append(row)
 
         obs = next_obs
         step += 1
@@ -324,13 +330,25 @@ def _build_eval_split(df: pd.DataFrame, test_cfg: PPOTestConfig, ts_col: str = "
     }
     return df_te, meta
 
-def build_test_env(env_cfg,test_cfg):
+def build_test_env(env_cfg, test_cfg):
     df = pd.read_csv(test_cfg.test_csv)
     df, split_meta = _build_eval_split(df, test_cfg, ts_col="timestamp")
     print(f"[ppo_test] eval split meta: {split_meta}")
 
     feature_cols = df.columns.drop(list(test_cfg.drop_cols)).to_list()
-    X_test,close_test = df_to_arrays(df,feature_cols,close_col=test_cfg.close_col,dropna=True)
+    sub = df[feature_cols + [test_cfg.close_col]].copy()
+    mask = sub.notna().all(axis=1)
+    df_align = df.loc[mask].reset_index(drop=True)
+    sub_ok = sub.loc[mask].reset_index(drop=True)
+    X_test = sub_ok[feature_cols].to_numpy(dtype=np.float32)
+    close_test = sub_ok[test_cfg.close_col].to_numpy(dtype=np.float32)
+
+    regime_ids = None
+    if all(c in df_align.columns for c in _HMM_PRED_OH):
+        regime_ids = (
+            df_align[list(_HMM_PRED_OH)].to_numpy(dtype=np.float32).argmax(axis=1).astype(np.int64)
+        )
+
     eval_env_cfg = TradingEnvConfig(
         fee_bps=env_cfg.fee_bps,
         hold_cost_bps=env_cfg.hold_cost_bps,
@@ -339,8 +357,8 @@ def build_test_env(env_cfg,test_cfg):
         start_index=env_cfg.start_index,
         seed=env_cfg.seed,
     )
-    env = TradingEnv(X_test,close_test,eval_env_cfg)
-    return env,df
+    env = TradingEnv(X_test, close_test, eval_env_cfg, regime_ids=regime_ids)
+    return env, df
 
 
 def run_ppo_backtest(

@@ -1,9 +1,11 @@
 from __future__ import annotations
 from typing import Any
 from dataclasses import dataclass,asdict,is_dataclass
-import numpy as np
 import json
 import os
+import warnings
+
+import numpy as np
 from ppo import PPOConfig, ActorCritic, TradingEnv, TradingEnvConfig
 from ppo_test import summarize, plot_backtest, buy_and_hold
 import matplotlib.pyplot as plt
@@ -55,8 +57,8 @@ def _timestamp_range_meta(df: pd.DataFrame, ts_col: str) -> dict[str, str | None
 class MoEDataConfig:
     csv_path:str = "data/data_e.csv"
     close_col:str = "close_5m"
-    regime_cols:tuple[str,...] = ("state_0","state_1","state_2","state_3")
-    drop_cols:tuple[str,...] = ("timestamp","regime","close_5m","state_0","state_1","state_2","state_3")
+    regime_cols:tuple[str,...] = ("hmm_predicted_state_0","hmm_predicted_state_1","hmm_predicted_state_2","hmm_predicted_state_3")
+    drop_cols:tuple[str,...] = ("timestamp","regime","close_5m","hmm_predicted_state_0","hmm_predicted_state_1","hmm_predicted_state_2","hmm_predicted_state_3")
     train_ratio:float = 0.8  # fallback if split_config missing or time masks empty
     split_config_path:str | None = None  # optional explicit path to split JSON
     # Optional ISO-8601 UTC strings; only applied when split_config.json is used (with lstm_train_end / test_start).
@@ -66,6 +68,9 @@ class MoEDataConfig:
 
 def build_regime_ids(df,regime_cols):
     return df.loc[:,regime_cols].to_numpy(dtype = np.float32).argmax(axis = 1).astype(np.int64)
+
+
+_HMM_PRED_OH: tuple[str, ...] = tuple(f"hmm_predicted_state_{i}" for i in range(4))
 
 
 def moe_train_test_split(
@@ -144,8 +149,32 @@ def moe_train_test_split(
                         "using test_start_effective = max(test_start, rl_train_end_effective) for RL test mask."
                     ]
                 return df_tr, df_te, meta
-        except (KeyError, ValueError, TypeError):
-            pass
+            warnings.warn(
+                "moe_train_test_split: split_config masks produced empty train or test set; "
+                f"falling back to train_ratio={data_cfg.train_ratio}.",
+                UserWarning,
+                stacklevel=2,
+            )
+        except (KeyError, ValueError, TypeError) as e:
+            warnings.warn(
+                f"moe_train_test_split: split_config calendar path failed ({e!r}); "
+                f"falling back to train_ratio={data_cfg.train_ratio}.",
+                UserWarning,
+                stacklevel=2,
+            )
+    else:
+        if raw is None:
+            warnings.warn(
+                "moe_train_test_split: split_config.json not found; using train_ratio fallback.",
+                UserWarning,
+                stacklevel=2,
+            )
+        elif ts_col not in df.columns:
+            warnings.warn(
+                f"moe_train_test_split: column {ts_col!r} not in dataframe; using train_ratio fallback.",
+                UserWarning,
+                stacklevel=2,
+            )
     split_idx = int(len(df) * data_cfg.train_ratio)
     df_tr = df.iloc[:split_idx].copy()
     df_te = df.iloc[split_idx:].copy()
@@ -555,7 +584,12 @@ def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every =
 # BackTest
 
 @torch.no_grad()
-def backtest_moe(agent:HardMoEAgent,env,capital:float=1.0) -> pd.DataFrame:
+def backtest_moe(
+    agent: HardMoEAgent,
+    env,
+    capital: float = 1.0,
+    hmm_regime_ids: np.ndarray | None = None,
+) -> pd.DataFrame:
     agent.eval_mode()
     obs_np = env.reset()
     done = False
@@ -600,6 +634,8 @@ def backtest_moe(agent:HardMoEAgent,env,capital:float=1.0) -> pd.DataFrame:
         }
         if "regime" in info:
             row["next_regime_id"] = int(info["regime"])
+        if hmm_regime_ids is not None and 0 <= t < len(hmm_regime_ids):
+            row["hmm_regime_id"] = int(hmm_regime_ids[t])
 
         rows.append(row)
 
@@ -633,7 +669,12 @@ def run_moe_backtest(bundle_path,env_cfg,data_cfg = None,capital = 1.0,out_csv =
     env = TradingEnv(X_test,close_test,eval_env_cfg,regime_ids=regime_ids_test)
     agent = HardMoEAgent(obs_dims=env.X.shape[1],cfg=ppo_cfg,n_experts=n_experts)
     load_moe_bundle(bundle_path,agent,map_location=agent.device)
-    steps = backtest_moe(agent,env,capital=capital)
+    hmm_regime_ids = None
+    if all(c in df_test_used.columns for c in _HMM_PRED_OH):
+        hmm_regime_ids = (
+            df_test_used[list(_HMM_PRED_OH)].to_numpy(dtype=np.float32).argmax(axis=1).astype(np.int64)
+        )
+    steps = backtest_moe(agent, env, capital=capital, hmm_regime_ids=hmm_regime_ids)
     summary = summarize(steps)
     bh_steps = pd.DataFrame()
     bh_summary = {}
@@ -673,8 +714,8 @@ if __name__ == "__main__":
     data_cfg = MoEDataConfig(
         csv_path="data/data_e.csv",
         close_col="close_5m",
-        regime_cols=("state_0", "state_1", "state_2", "state_3"),
-        drop_cols=("timestamp", "regime", "close_5m", "state_0", "state_1", "state_2", "state_3"),
+        regime_cols=("hmm_predicted_state_0", "hmm_predicted_state_1", "hmm_predicted_state_2", "hmm_predicted_state_3"),
+        drop_cols=("timestamp", "regime", "close_5m", "hmm_predicted_state_0", "hmm_predicted_state_1", "hmm_predicted_state_2", "hmm_predicted_state_3"),
         train_ratio=0.8,
     )
     ppo_cfg = PPOConfig()
