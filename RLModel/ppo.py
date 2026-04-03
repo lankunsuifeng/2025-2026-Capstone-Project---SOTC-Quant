@@ -36,6 +36,24 @@ def df_to_arrays(df:pd.DataFrame,feature_cols:List[str],close_col:str = "close",
     close = use[close_col].to_numpy(dtype=np.float32)
     return X,close
 
+
+def _rolling_sharpe_past_bars(close: np.ndarray, t: int, window: int, eps: float = 1e-8) -> float:
+    """
+    Sharpe-like ratio from **past** simple returns only (no future close).
+    Uses ``close[t-window : t+1]`` → ``window`` returns ending at bar t-1→t.
+    """
+    if window < 2 or t < window:
+        return 0.0
+    seg = close[t - window : t + 1].astype(np.float64, copy=False)
+    prev = seg[:-1]
+    rets = (seg[1:] - prev) / np.maximum(prev, 1e-15)
+    if rets.size < 2:
+        return 0.0
+    m = float(np.mean(rets))
+    s = float(np.std(rets, ddof=1))
+    return float(m / (s + eps))
+
+
 # Environment
 @dataclass
 class TradingEnvConfig:
@@ -45,6 +63,15 @@ class TradingEnvConfig:
     random_start: bool = True
     start_index: int = 1
     seed: int = 42
+    # Reward uses cumulative return over the next ``forward_return_bars`` bars (clipped near series end).
+    # Mark-to-market / backtest still use info["ret"] = 1-bar return (t -> t+1).
+    forward_return_bars: int = 1
+    # In reward only: multiply fee penalty by this (<1 encourages turnover). info["fee"] stays full fee.
+    fee_reward_discount: float = 0.9
+    # Past-only rolling Sharpe (window simple returns ending at t); 0 disables.
+    rolling_sharpe_window: int = 0
+    rolling_sharpe_coef: float = 0.01
+    rolling_sharpe_clip: float = 5.0
 
 
 class TradingEnv:
@@ -79,14 +106,19 @@ class TradingEnv:
         self.pos = 0
         self.steps = 0
 
+        h_need = max(1, int(self.cfg.forward_return_bars))
         if self.cfg.random_start and self.cfg.max_episode_steps is not None:
-            # Need at least one future bar for reward: t -> t+1
+            # First step needs t + h_need <= T - 1 for full forward window when possible
             max_start = self.T - self.cfg.max_episode_steps - 1
             max_start = max(max_start, self.cfg.start_index)
-            max_start = min(max_start, self.T - 2)
+            max_start = min(max_start, self.T - 2, self.T - 1 - h_need)
+            if max_start < self.cfg.start_index:
+                max_start = self.cfg.start_index
             self.episode_start = int(self.rng.integers(self.cfg.start_index, max_start + 1))
         else:
-            self.episode_start = min(self.cfg.start_index, self.T - 2)
+            self.episode_start = min(self.cfg.start_index, self.T - 2, self.T - 1 - h_need)
+            if self.episode_start < self.cfg.start_index:
+                self.episode_start = min(self.cfg.start_index, self.T - 2)
 
         self.t = self.episode_start
         return self.X[self.t]
@@ -100,13 +132,34 @@ class TradingEnv:
             raise RuntimeError("No Future Data Available")
         new_pos = action
 
-        # Future Return
-        ret = (self.close[self.t+1] + 1e-15) / (self.close[self.t] + 1e-15) - 1.0
+        t = self.t
+        h = max(1, int(self.cfg.forward_return_bars))
+        max_ahead = (self.T - 1) - t
+        h_eff = int(min(h, max_ahead))
+
+        # 1-bar return: used by backtest (mark-to-market) and logged as info["ret"]
+        ret_1 = (self.close[t + 1] + 1e-15) / (self.close[t] + 1e-15) - 1.0
+        # Multi-bar cumulative return: used in reward (same position held over h_eff bars)
+        ret_fwd = (self.close[t + h_eff] + 1e-15) / (self.close[t] + 1e-15) - 1.0
+
         turnover = abs(new_pos - self.pos)
         cost_fee = self.fee * turnover
-        cost_hold = self.hold_cost * abs(new_pos)
-        reward = new_pos * ret - cost_fee - cost_hold
-        reward = 1000 * reward  #Scale
+        cost_hold = self.hold_cost * (abs(new_pos)-1) * float(h_eff)
+        fee_in_reward = cost_fee * float(self.cfg.fee_reward_discount)
+
+        sharpe_bonus = 0.0
+        roll_sh = 0.0
+        w_sh = int(self.cfg.rolling_sharpe_window)
+        if w_sh >= 2:
+            roll_sh = _rolling_sharpe_past_bars(self.close, t, w_sh)
+            c = float(self.cfg.rolling_sharpe_coef)
+            clip = float(self.cfg.rolling_sharpe_clip)
+            if clip > 0:
+                roll_sh = float(np.clip(roll_sh, -clip, clip))
+            sharpe_bonus = c * roll_sh
+
+        reward = new_pos * ret_fwd - fee_in_reward - cost_hold + sharpe_bonus
+        reward = 2000 * reward  #Scale
         self.pos = new_pos
         self.t += 1
         self.steps += 1
@@ -120,11 +173,16 @@ class TradingEnv:
         info = {
 
             "t":next_t,
-            "ret":ret,
+            "ret": ret_1,
+            "ret_forward": ret_fwd,
+            "forward_horizon_used": h_eff,
             "pos":self.pos,
             "turnover":turnover,
             "fee":cost_fee,
+            "fee_in_reward": float(fee_in_reward),
             "hold_cost":cost_hold,
+            "rolling_sharpe_past": float(roll_sh),
+            "sharpe_bonus_unscaled": float(sharpe_bonus),
         }
         if self.regime is not None:
             info["regime"] = int(self.regime[next_t])

@@ -612,6 +612,30 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--model-root", default="model/experiments")
     p.add_argument("--result-root", default="result/experiments")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--forward-return-bars",
+        type=int,
+        default=1,
+        help="TradingEnv reward horizon: cumulative return over next N bars (1 = original 1-bar). Backtest equity still uses 1-bar info['ret'].",
+    )
+    p.add_argument(
+        "--fee-reward-discount",
+        type=float,
+        default=0.9,
+        help="Reward subtracts fee * this (info['fee'] unchanged for backtest). <1 encourages trading.",
+    )
+    p.add_argument(
+        "--rolling-sharpe-window",
+        type=int,
+        default=0,
+        help="Past-only rolling Sharpe bonus in reward; 0 off. Uses W returns through bar t (no future leak).",
+    )
+    p.add_argument(
+        "--rolling-sharpe-coef",
+        type=float,
+        default=0.01,
+        help="Multiplier on clipped rolling Sharpe added to reward (before x1000).",
+    )
     args = p.parse_args(argv)
 
     if args.all:
@@ -642,6 +666,23 @@ def main(argv: list[str] | None = None) -> None:
     )
     cfg.env_cfg.seed = args.seed
     cfg.eval_env_cfg.seed = args.seed
+    if args.forward_return_bars < 1:
+        print("--forward-return-bars must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    cfg.env_cfg.forward_return_bars = int(args.forward_return_bars)
+    cfg.eval_env_cfg.forward_return_bars = int(args.forward_return_bars)
+    if args.fee_reward_discount < 0:
+        print("--fee-reward-discount must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    cfg.env_cfg.fee_reward_discount = float(args.fee_reward_discount)
+    cfg.eval_env_cfg.fee_reward_discount = float(args.fee_reward_discount)
+    if args.rolling_sharpe_window < 0:
+        print("--rolling-sharpe-window must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    cfg.env_cfg.rolling_sharpe_window = int(args.rolling_sharpe_window)
+    cfg.eval_env_cfg.rolling_sharpe_window = int(args.rolling_sharpe_window)
+    cfg.env_cfg.rolling_sharpe_coef = float(args.rolling_sharpe_coef)
+    cfg.eval_env_cfg.rolling_sharpe_coef = float(args.rolling_sharpe_coef)
 
     run_experiments(selected, cfg)
 

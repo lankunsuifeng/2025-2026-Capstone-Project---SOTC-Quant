@@ -1,7 +1,7 @@
 {
   "_comment": "Single source of truth for time-based splits. Edit dates to match your dataset. ISO-8601 UTC.",
-  "hmm_fit_end": "2024-02-01T00:00:00Z",
-  "lstm_train_end": "2024-02-01T00:00:00Z",
+  "hmm_fit_end": "2023-02-01T00:00:00Z",
+  "lstm_train_end": "2023-02-01T00:00:00Z",
   "rl_train_end": "2025-02-01T00:00:00Z",
   "test_start": "2025-02-01T00:00:00Z"
 }
