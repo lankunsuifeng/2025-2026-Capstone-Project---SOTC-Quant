@@ -357,6 +357,14 @@ def build_test_env(env_cfg, test_cfg):
         random_start=False,
         start_index=env_cfg.start_index,
         seed=env_cfg.seed,
+        forward_return_bars=env_cfg.forward_return_bars,
+        fee_reward_discount=env_cfg.fee_reward_discount,
+        turnover_penalty_coef=env_cfg.turnover_penalty_coef,
+        position_shaping_coef=env_cfg.position_shaping_coef,
+        reward_scale=env_cfg.reward_scale,
+        rolling_sharpe_window=env_cfg.rolling_sharpe_window,
+        rolling_sharpe_coef=env_cfg.rolling_sharpe_coef,
+        rolling_sharpe_clip=env_cfg.rolling_sharpe_clip,
     )
     env = TradingEnv(X_test, close_test, eval_env_cfg, regime_ids=regime_ids)
     return env, df
@@ -414,6 +422,8 @@ def run_ppo_backtest(
 
 
 if __name__ == "__main__":
+    from seed_utils import set_training_seed
+
     policy_path = "model/ppo_policy.pt"
 
     env_cfg = TradingEnvConfig(
@@ -424,6 +434,7 @@ if __name__ == "__main__":
         start_index=1,
         seed=42,
     )
+    set_training_seed(int(env_cfg.seed))
 
     test_cfg = PPOTestConfig(
         agent_path="model/ppo_policy.pt",

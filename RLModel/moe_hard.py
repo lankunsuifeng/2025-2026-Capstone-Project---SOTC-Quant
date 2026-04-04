@@ -224,6 +224,7 @@ def _ppo_cfg_to_dict(cfg: PPOConfig) -> dict[str, Any]:
         "gae_lambda": cfg.gae_lambda,
         "clip_eps": cfg.clip_eps,
         "ent_coef": cfg.ent_coef,
+        "ent_coef_end": cfg.ent_coef_end,
         "vf_coef": cfg.vf_coef,
         "lr": cfg.lr,
         "max_grad_norm": cfg.max_grad_norm,
@@ -257,6 +258,7 @@ def save_moe_bundle(out_dir,agent,ppo_cfg,env_cfg = None,extra_meta = None):
             "random_start":env_cfg.random_start,
             "start_index":env_cfg.start_index,
             "seed":env_cfg.seed,
+            "reward_scale":env_cfg.reward_scale,
         }
     if extra_meta:
         meta["extra_meta"] = extra_meta
@@ -340,7 +342,8 @@ class HardMoEAgent(nn.Module):
         act_idx = int(torch.argmax(logits,dim = -1).item())
         env_action = int(self.IDX_TO_ACT[act_idx])
         return env_action,float(value.item())
-    def ppo_loss_for_subset(self,expert_id,mb_obs,mb_act,mb_oldlog,mb_adv,mb_ret):
+    def ppo_loss_for_subset(self,expert_id,mb_obs,mb_act,mb_oldlog,mb_adv,mb_ret,ent_coef=None):
+        ec = ent_coef if ent_coef is not None else self.cfg.ent_coef
         expert = self.get_expert(expert_id)
         logits,values = expert(mb_obs)
         dist = torch.distributions.Categorical(logits=logits)
@@ -352,11 +355,11 @@ class HardMoEAgent(nn.Module):
         pi_loss = -torch.min(surr1,surr2).mean()
 
         v_loss = ((values - mb_ret)**2).mean()
-        loss = pi_loss + self.cfg.vf_coef * v_loss - self.cfg.ent_coef * entropy
+        loss = pi_loss + self.cfg.vf_coef * v_loss - ec * entropy
 
         return loss,pi_loss,v_loss,entropy
     
-    def update_one_expert(self,expert_id,mb_obs,mb_act,mb_oldlog,mb_adv,mb_ret):
+    def update_one_expert(self,expert_id,mb_obs,mb_act,mb_oldlog,mb_adv,mb_ret,ent_coef=None):
         optimizer = self.optimizers[expert_id]
         optimizer.zero_grad()
 
@@ -367,6 +370,7 @@ class HardMoEAgent(nn.Module):
             mb_oldlog = mb_oldlog,
             mb_adv = mb_adv,
             mb_ret = mb_ret,
+            ent_coef=ent_coef,
         )
 
         loss.backward()
@@ -381,7 +385,7 @@ class HardMoEAgent(nn.Module):
             "n_samples":int(len(mb_obs)),
         }
     
-    def update_from_buffer(self,batch:MoERolloutBatch,minibatch_size,update_epochs):
+    def update_from_buffer(self,batch:MoERolloutBatch,minibatch_size,update_epochs,ent_coef=None):
         if minibatch_size is None:
             minibatch_size = self.cfg.minibatch_size
         if update_epochs is None:
@@ -413,7 +417,7 @@ class HardMoEAgent(nn.Module):
                     mask = mb_regime == expert_id
                     if not torch.any(mask):
                         continue
-                    result = self.update_one_expert(expert_id,mb_obs[mask],mb_act[mask],mb_oldlog[mask],mb_adv[mask],mb_ret[mask])
+                    result = self.update_one_expert(expert_id,mb_obs[mask],mb_act[mask],mb_oldlog[mask],mb_adv[mask],mb_ret[mask],ent_coef=ent_coef)
                     stats["loss"] += result["loss"]
                     stats["pi_loss"] += result["pi_loss"]
                     stats["v_loss"] += result["v_loss"]
@@ -490,9 +494,13 @@ class MoERollingBuffer:
 # Train experts(main code here)
 def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every = 10):
     agent.train_mode()
-    obs_dim = env.X.shape[1]
+    obs_dim = env.obs_dim()
     obs_np = env.reset()
     obs = torch.tensor(obs_np,dtype=torch.float32,device = agent.device)
+
+    ent_start = float(agent.cfg.ent_coef)
+    ent_end = float(agent.cfg.ent_coef_end) if agent.cfg.ent_coef_end is not None else ent_start
+
     history = {
         "upd": [],
         "rollout_reward_mean": [],
@@ -508,6 +516,9 @@ def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every =
     for expert_id in range(agent.n_experts):
         history[f"expert_{expert_id}_steps"] = []
     for upd in range(total_updates):
+        frac = upd / max(total_updates - 1, 1)
+        ent_coef_t = ent_start + (ent_end - ent_start) * frac
+
         buf = MoERollingBuffer(agent.cfg.rollout_steps,obs_dim,agent.device)
         r_sum = 0.0
         fee_sum = 0.0
@@ -555,6 +566,7 @@ def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every =
             batch=batch,
             minibatch_size=agent.cfg.minibatch_size,
             update_epochs=agent.cfg.update_epochs,
+            ent_coef=ent_coef_t,
         )
 
         if (upd + 1) % log_every == 0 or upd == 0:
@@ -582,6 +594,7 @@ def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every =
                 f"|pos|={abspos_mean:.3f} turn={turnover_mean:.3f} fee_sum={fee_sum:.3e} "
                 f"loss={train_stats['loss']:.3e} pi={train_stats['pi_loss']:.3e} "
                 f"v={train_stats['v_loss']:.3e} ent={train_stats['entropy']:.3e} "
+                f"ent_coef={ent_coef_t:.4f} "
                 f"exp_counts={regime_counts.tolist()}"
             )
     return agent,history
@@ -670,9 +683,17 @@ def run_moe_backtest(bundle_path,env_cfg,data_cfg = None,capital = 1.0,out_csv =
         random_start=False,
         start_index=env_cfg.start_index,
         seed=env_cfg.seed,
+        forward_return_bars=env_cfg.forward_return_bars,
+        fee_reward_discount=env_cfg.fee_reward_discount,
+        turnover_penalty_coef=env_cfg.turnover_penalty_coef,
+        position_shaping_coef=env_cfg.position_shaping_coef,
+        reward_scale=env_cfg.reward_scale,
+        rolling_sharpe_window=env_cfg.rolling_sharpe_window,
+        rolling_sharpe_coef=env_cfg.rolling_sharpe_coef,
+        rolling_sharpe_clip=env_cfg.rolling_sharpe_clip,
     )
     env = TradingEnv(X_test,close_test,eval_env_cfg,regime_ids=regime_ids_test)
-    agent = HardMoEAgent(obs_dims=env.X.shape[1],cfg=ppo_cfg,n_experts=n_experts)
+    agent = HardMoEAgent(obs_dims=env.obs_dim(),cfg=ppo_cfg,n_experts=n_experts)
     load_moe_bundle(bundle_path,agent,map_location=agent.device)
     hmm_regime_ids = None
     if all(c in df_test_used.columns for c in _HMM_PRED_OH):
@@ -716,6 +737,8 @@ def run_moe_backtest(bundle_path,env_cfg,data_cfg = None,capital = 1.0,out_csv =
 
     
 if __name__ == "__main__":
+    from seed_utils import set_training_seed
+
     data_cfg = MoEDataConfig(
         csv_path="data/data_e.csv",
         close_col="close_5m",
@@ -732,6 +755,7 @@ if __name__ == "__main__":
         start_index=1,
         seed=56,
     )
+    set_training_seed(int(env_cfg.seed))
     model_dir = "model/moe_hard"
     out_csv = "result/moe_backtest_steps.csv"
     plot_dir = "plots"
@@ -757,7 +781,7 @@ if __name__ == "__main__":
     )
 
     agent = HardMoEAgent(
-        obs_dims=train_env.X.shape[1],
+        obs_dims=train_env.obs_dim(),
         cfg=ppo_cfg,
         n_experts=len(data_cfg.regime_cols),
     )

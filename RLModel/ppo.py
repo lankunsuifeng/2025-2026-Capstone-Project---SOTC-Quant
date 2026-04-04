@@ -67,7 +67,14 @@ class TradingEnvConfig:
     # Mark-to-market / backtest still use info["ret"] = 1-bar return (t -> t+1).
     forward_return_bars: int = 1
     # In reward only: multiply fee penalty by this (<1 encourages turnover). info["fee"] stays full fee.
-    fee_reward_discount: float = 0.9
+    fee_reward_discount: float = 1.0
+    # Extra reward cost per unit |Δposition| (0/1/2), before reward_scale; discourages churn vs fee alone.
+    turnover_penalty_coef: float = 0.001
+    # Reward-only shaping: adds coef*(|pos|-1)*h_eff per step (coef>0 penalizes flat 0, encourages ±1).
+    # Does not change info["hold_cost"]; backtest equity uses hold_cost only (real carry on |pos|).
+    position_shaping_coef: float = 0.0
+    # Scale raw reward (5m returns ~1e-4); stronger gradient signal for the value / policy heads.
+    reward_scale: float = 1000.0
     # Past-only rolling Sharpe (window simple returns ending at t); 0 disables.
     rolling_sharpe_window: int = 0
     rolling_sharpe_coef: float = 0.01
@@ -100,15 +107,21 @@ class TradingEnv:
         self.steps = 0
         self.episode_start = cfg.start_index
 
+        self._pos_onehot_table = np.eye(3, dtype=np.float32)
+
+    def _pos_onehot(self) -> np.ndarray:
+        """[is_short, is_cash, is_long] for current self.pos ∈ {-1, 0, 1}."""
+        return self._pos_onehot_table[self.pos + 1]
+
     def obs_dim(self)->int:
-        return self.X.shape[1]
+        return self.X.shape[1] + 3
+
     def reset(self) -> np.ndarray:
         self.pos = 0
         self.steps = 0
 
         h_need = max(1, int(self.cfg.forward_return_bars))
         if self.cfg.random_start and self.cfg.max_episode_steps is not None:
-            # First step needs t + h_need <= T - 1 for full forward window when possible
             max_start = self.T - self.cfg.max_episode_steps - 1
             max_start = max(max_start, self.cfg.start_index)
             max_start = min(max_start, self.T - 2, self.T - 1 - h_need)
@@ -121,7 +134,7 @@ class TradingEnv:
                 self.episode_start = min(self.cfg.start_index, self.T - 2)
 
         self.t = self.episode_start
-        return self.X[self.t]
+        return np.concatenate([self.X[self.t], self._pos_onehot()])
     
     def step(self,action:int):
 
@@ -144,8 +157,16 @@ class TradingEnv:
 
         turnover = abs(new_pos - self.pos)
         cost_fee = self.fee * turnover
-        cost_hold = self.hold_cost * (abs(new_pos)-1) * float(h_eff)
+        # Accounting carry for backtest (info) and PnL: proportional to |pos|, never negative.
+        cost_hold = self.hold_cost * abs(new_pos) * float(h_eff)
         fee_in_reward = cost_fee * float(self.cfg.fee_reward_discount)
+        turnover_penalty = float(self.cfg.turnover_penalty_coef) * float(turnover)
+        # (|pos|-1) is 0 at ±1 and -1 at cash; positive coef → strictly penalize flat in reward only.
+        position_shape = (
+            float(self.cfg.position_shaping_coef)
+            * (float(abs(new_pos)) - 1.0)
+            * float(h_eff)
+        )
 
         sharpe_bonus = 0.0
         roll_sh = 0.0
@@ -158,8 +179,15 @@ class TradingEnv:
                 roll_sh = float(np.clip(roll_sh, -clip, clip))
             sharpe_bonus = c * roll_sh
 
-        reward = new_pos * ret_fwd - fee_in_reward - cost_hold + sharpe_bonus
-        reward = 2000 * reward  #Scale
+        reward = (
+            new_pos * ret_fwd
+            - fee_in_reward
+            - cost_hold
+            - turnover_penalty
+            + position_shape
+            + sharpe_bonus
+        )
+        reward = float(self.cfg.reward_scale) * reward
         self.pos = new_pos
         self.t += 1
         self.steps += 1
@@ -168,7 +196,7 @@ class TradingEnv:
         if self.cfg.max_episode_steps is not None:
             done = done or (self.steps >= self.cfg.max_episode_steps)
         next_t = min(self.t, self.T - 1)
-        obs = self.X[next_t]
+        obs = np.concatenate([self.X[next_t], self._pos_onehot()])
 
         info = {
 
@@ -180,6 +208,8 @@ class TradingEnv:
             "turnover":turnover,
             "fee":cost_fee,
             "fee_in_reward": float(fee_in_reward),
+            "turnover_penalty_unscaled": float(turnover_penalty),
+            "position_shaping_unscaled": float(position_shape),
             "hold_cost":cost_hold,
             "rolling_sharpe_past": float(roll_sh),
             "sharpe_bonus_unscaled": float(sharpe_bonus),
@@ -194,7 +224,8 @@ class PPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    ent_coef: float = 0.1
+    ent_coef: float = 0.01
+    ent_coef_end: Optional[float] = None  # None → no annealing; set to target for linear decay
     vf_coef: float = 0.5
     lr: float = 3e-4
     max_grad_norm: float = 0.5
@@ -277,7 +308,7 @@ class PPOAgent:
         self.env = env
         self.cfg = cfg
         self.device = cfg.device
-        obs_dim = env.X.shape[1]
+        obs_dim = env.obs_dim()
         self.model = ActorCritic(obs_dim=obs_dim,n_actions=n_actions,hidden = cfg.hidden).to(self.device)
         self.opt = optim.Adam(self.model.parameters(),lr = cfg.lr)
 
@@ -291,7 +322,7 @@ class PPOAgent:
     def train(self, total_updates=200, log_every=10, plot_path: str = "RLModel/train_plots/training_curves.png"):
         os.makedirs(os.path.dirname(plot_path) or ".", exist_ok=True)
 
-        obs_dim = self.env.X.shape[1]
+        obs_dim = self.env.obs_dim()
         obs_np = self.env.reset()
         obs = torch.tensor(obs_np, device=self.device)
 
@@ -307,7 +338,13 @@ class PPOAgent:
             "entropy": [],
         }
 
+        ent_start = float(self.cfg.ent_coef)
+        ent_end = float(self.cfg.ent_coef_end) if self.cfg.ent_coef_end is not None else ent_start
+
         for upd in range(total_updates):
+            frac = upd / max(total_updates - 1, 1)
+            ent_coef_t = ent_start + (ent_end - ent_start) * frac
+
             buf = RollingBuffer(self.cfg.rollout_steps, obs_dim, self.device)
 
             # --- rollout stats ---
@@ -362,7 +399,7 @@ class PPOAgent:
                     pi_loss = -torch.min(surr1, surr2).mean()
 
                     v_loss = ((values - mb_ret) ** 2).mean()
-                    loss = pi_loss + self.cfg.vf_coef * v_loss - self.cfg.ent_coef * entropy
+                    loss = pi_loss + self.cfg.vf_coef * v_loss - ent_coef_t * entropy
 
                     self.opt.zero_grad()
                     loss.backward()
@@ -397,7 +434,8 @@ class PPOAgent:
                     f"[PPO] upd={upd+1}/{total_updates} "
                     f"r_mean={r_mean:.3e} r_sum={r_sum:.3e} "
                     f"|pos|={abspos_mean:.3f} turn={turnover_mean:.3f} fee_sum={fee_sum:.3e} "
-                    f"pi={avg_pi_loss:.3e} v={avg_v_loss:.3e} ent={avg_ent:.3e}"
+                    f"pi={avg_pi_loss:.3e} v={avg_v_loss:.3e} ent={avg_ent:.3e} "
+                    f"ent_coef={ent_coef_t:.4f}"
                 )
 
         # --- plot after training ---
@@ -473,8 +511,9 @@ class PPOAgent:
 
 
 if __name__ == "__main__":
-    cfg = PPOConfig()
+    from seed_utils import set_training_seed
 
+    cfg = PPOConfig()
     bar = pd.read_csv("data/data_e.csv")
     _excl = [c for c in ("timestamp", "close_5m") if c in bar.columns]
     feature_cols = bar.columns.drop(_excl).tolist()
@@ -484,6 +523,7 @@ if __name__ == "__main__":
     df_test = df.iloc[spilt_idx:].copy()
     X,close = df_to_arrays(df_train,feature_cols,close_col="close_5m",dropna=True)
     env_cfg = TradingEnvConfig(fee_bps=0.2,hold_cost_bps=0.2,max_episode_steps=10000,random_start=True,seed=42)
+    set_training_seed(int(env_cfg.seed))
     env = TradingEnv(X,close,env_cfg)
     agent = PPOAgent(env, cfg)
     agent.train(total_updates=200)

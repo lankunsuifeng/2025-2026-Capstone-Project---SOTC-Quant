@@ -34,6 +34,7 @@ import pandas as pd
 
 from ppo import PPOAgent, PPOConfig, TradingEnv, TradingEnvConfig, df_to_arrays
 from ppo_test import PPOTestConfig, buy_and_hold, run_ppo_backtest, summarize
+from seed_utils import set_training_seed
 from moe_hard import (
     HardMoEAgent,
     MoEDataConfig,
@@ -222,8 +223,8 @@ class RunnerConfig:
     meta_root: str = "result/experiment_meta"
     env_cfg: TradingEnvConfig = field(
         default_factory=lambda: TradingEnvConfig(
-            fee_bps=5.0,
-            hold_cost_bps=0.1,
+            fee_bps=2.0,
+            hold_cost_bps=0.0,
             max_episode_steps=10000,
             random_start=True,
             start_index=1,
@@ -233,8 +234,8 @@ class RunnerConfig:
     ppo_cfg: PPOConfig = field(default_factory=PPOConfig)
     eval_env_cfg: TradingEnvConfig = field(
         default_factory=lambda: TradingEnvConfig(
-            fee_bps=5.0,
-            hold_cost_bps=0.1,
+            fee_bps=2.0,
+            hold_cost_bps=0.0,
             max_episode_steps=None,
             random_start=False,
             start_index=1,
@@ -476,7 +477,7 @@ def train_and_backtest_moe(
         regime_ids=regime_ids_train,
     )
     agent = HardMoEAgent(
-        obs_dims=train_env.X.shape[1],
+        obs_dims=train_env.obs_dim(),
         cfg=cfg.ppo_cfg,
         n_experts=len(data_cfg.regime_cols),
     )
@@ -560,6 +561,7 @@ def run_experiments(
     cfg: RunnerConfig | None = None,
 ) -> pd.DataFrame:
     cfg = cfg or RunnerConfig()
+    set_training_seed(int(cfg.env_cfg.seed))
     if not os.path.isfile(cfg.csv_path):
         raise FileNotFoundError(f"CSV not found: {cfg.csv_path}")
 
@@ -612,6 +614,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--model-root", default="model/experiments")
     p.add_argument("--result-root", default="result/experiments")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--ent-coef", type=float, default=0.1, help="Entropy coefficient for PPO loss (lower → less random policy).")
+    p.add_argument(
+        "--ent-coef-end",
+        type=float,
+        default=None,
+        help="If set, linearly anneal ent_coef from --ent-coef to this value over training. None = no annealing.",
+    )
     p.add_argument(
         "--forward-return-bars",
         type=int,
@@ -619,10 +628,28 @@ def main(argv: list[str] | None = None) -> None:
         help="TradingEnv reward horizon: cumulative return over next N bars (1 = original 1-bar). Backtest equity still uses 1-bar info['ret'].",
     )
     p.add_argument(
+        "--reward-scale",
+        type=float,
+        default=1000.0,
+        help="Multiply environment reward after PnL/fees/Sharpe bonus (5m raw returns are ~1e-4).",
+    )
+    p.add_argument(
         "--fee-reward-discount",
         type=float,
-        default=0.9,
+        default=1.0,
         help="Reward subtracts fee * this (info['fee'] unchanged for backtest). <1 encourages trading.",
+    )
+    p.add_argument(
+        "--turnover-penalty-coef",
+        type=float,
+        default=0.000,
+        help="Reward subtracts coef * |Δposition| each step (before --reward-scale); 0 disables.",
+    )
+    p.add_argument(
+        "--position-shaping-coef",
+        type=float,
+        default=0.00000,
+        help="Reward adds coef*(|pos|-1)*h_eff (penalizes flat cash, encourages ±1); not in equity step_ret. 0=off.",
     )
     p.add_argument(
         "--rolling-sharpe-window",
@@ -634,7 +661,7 @@ def main(argv: list[str] | None = None) -> None:
         "--rolling-sharpe-coef",
         type=float,
         default=0.01,
-        help="Multiplier on clipped rolling Sharpe added to reward (before x1000).",
+        help="Multiplier on clipped rolling Sharpe added to reward (before --reward-scale).",
     )
     args = p.parse_args(argv)
 
@@ -664,6 +691,8 @@ def main(argv: list[str] | None = None) -> None:
         model_root=args.model_root,
         result_root=args.result_root,
     )
+    cfg.ppo_cfg.ent_coef = float(args.ent_coef)
+    cfg.ppo_cfg.ent_coef_end = float(args.ent_coef_end) if args.ent_coef_end is not None else None
     cfg.env_cfg.seed = args.seed
     cfg.eval_env_cfg.seed = args.seed
     if args.forward_return_bars < 1:
@@ -671,11 +700,23 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     cfg.env_cfg.forward_return_bars = int(args.forward_return_bars)
     cfg.eval_env_cfg.forward_return_bars = int(args.forward_return_bars)
+    if args.reward_scale <= 0:
+        print("--reward-scale must be > 0", file=sys.stderr)
+        sys.exit(1)
+    cfg.env_cfg.reward_scale = float(args.reward_scale)
+    cfg.eval_env_cfg.reward_scale = float(args.reward_scale)
     if args.fee_reward_discount < 0:
         print("--fee-reward-discount must be >= 0", file=sys.stderr)
         sys.exit(1)
     cfg.env_cfg.fee_reward_discount = float(args.fee_reward_discount)
     cfg.eval_env_cfg.fee_reward_discount = float(args.fee_reward_discount)
+    if args.turnover_penalty_coef < 0:
+        print("--turnover-penalty-coef must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    cfg.env_cfg.turnover_penalty_coef = float(args.turnover_penalty_coef)
+    cfg.eval_env_cfg.turnover_penalty_coef = float(args.turnover_penalty_coef)
+    cfg.env_cfg.position_shaping_coef = float(args.position_shaping_coef)
+    cfg.eval_env_cfg.position_shaping_coef = float(args.position_shaping_coef)
     if args.rolling_sharpe_window < 0:
         print("--rolling-sharpe-window must be >= 0", file=sys.stderr)
         sys.exit(1)
