@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from data_process import resample_bars
 from ppo import PPOAgent, PPOConfig, TradingEnv, TradingEnvConfig, df_to_arrays
 from ppo_test import PPOTestConfig, buy_and_hold, run_ppo_backtest, summarize
 from seed_utils import set_training_seed
@@ -215,6 +216,7 @@ class RunnerConfig:
     close_col: str = "close_5m"
     train_ratio: float = 0.8
     split_config_path: str | None = None
+    resample_minutes: int = 0  # 0 = no resample; 15 = resample 5m bars to 15m
     total_updates: int = 200
     log_every: int = 10
     capital: float = 10.0
@@ -223,7 +225,7 @@ class RunnerConfig:
     meta_root: str = "result/experiment_meta"
     env_cfg: TradingEnvConfig = field(
         default_factory=lambda: TradingEnvConfig(
-            fee_bps=2.0,
+            fee_bps=5.0,
             hold_cost_bps=0.0,
             max_episode_steps=10000,
             random_start=True,
@@ -234,7 +236,7 @@ class RunnerConfig:
     ppo_cfg: PPOConfig = field(default_factory=PPOConfig)
     eval_env_cfg: TradingEnvConfig = field(
         default_factory=lambda: TradingEnvConfig(
-            fee_bps=2.0,
+            fee_bps=5.0,
             hold_cost_bps=0.0,
             max_episode_steps=None,
             random_start=False,
@@ -569,6 +571,17 @@ def run_experiments(
     os.makedirs(cfg.result_root, exist_ok=True)
 
     df = pd.read_csv(cfg.csv_path)
+    if cfg.resample_minutes > 5:
+        orig_len = len(df)
+        df = resample_bars(df, minutes=cfg.resample_minutes, close_col=cfg.close_col)
+        resampled_path = cfg.csv_path.replace(".csv", f"_{cfg.resample_minutes}m_tmp.csv")
+        os.makedirs(os.path.dirname(resampled_path) or ".", exist_ok=True)
+        df.to_csv(resampled_path, index=False)
+        cfg.csv_path = resampled_path
+        print(
+            f"[resample] {orig_len} rows @ 5m → {len(df)} rows @ {cfg.resample_minutes}m "
+            f"(ratio {orig_len / max(len(df), 1):.1f}x)  saved to {resampled_path}"
+        )
     rows: list[dict[str, Any]] = []
 
     for eid in experiment_ids:
@@ -608,6 +621,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.add_argument("--train-ratio", type=float, default=0.8, help="Fallback if split_config missing")
     p.add_argument("--split-config", type=str, default="", help="Optional path to split_config.json")
+    p.add_argument(
+        "--resample-minutes",
+        type=int,
+        default=0,
+        help="Resample 5m bars to N-minute bars before training/test (0 = no resample, 15 = 15m).",
+    )
     p.add_argument("--updates", type=int, default=200, help="PPO / MoE training updates")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--capital", type=float, default=10.0)
@@ -685,6 +704,7 @@ def main(argv: list[str] | None = None) -> None:
         csv_path=args.csv,
         train_ratio=args.train_ratio,
         split_config_path=args.split_config or None,
+        resample_minutes=int(args.resample_minutes),
         total_updates=args.updates,
         log_every=args.log_every,
         capital=args.capital,

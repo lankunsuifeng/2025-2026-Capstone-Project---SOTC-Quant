@@ -624,6 +624,54 @@ def data_engineering(
 
     return out
 
+def resample_bars(
+    df: pd.DataFrame,
+    minutes: int = 15,
+    timestamp_col: str = "timestamp",
+    close_col: str = "close_5m",
+) -> pd.DataFrame:
+    """
+    Resample a 5-minute ``data_e`` DataFrame to a coarser bar frequency.
+
+    Aggregation rules per column type:
+      - close        → last (end-of-window price)
+      - log_ret_1    → sum  (log returns are additive)
+      - volume_zscore→ mean (average intensity over window)
+      - hl_range / log_hl → max (worst-case intra-window volatility)
+      - everything else (smoothed indicators, regime one-hots) → last
+    """
+    if minutes <= 5:
+        return df.copy()
+
+    tmp = df.copy()
+    tmp[timestamp_col] = pd.to_datetime(tmp[timestamp_col], utc=True)
+    tmp = tmp.sort_values(timestamp_col).reset_index(drop=True)
+
+    sum_cols = [c for c in tmp.columns if c.startswith("log_ret")]
+    mean_cols = [c for c in tmp.columns if "volume_zscore" in c]
+    max_cols = [c for c in tmp.columns if c.startswith("hl_range") or c.startswith("log_hl")]
+    special = set(sum_cols + mean_cols + max_cols + [timestamp_col])
+    last_cols = [c for c in tmp.columns if c not in special]
+
+    agg: dict[str, str] = {}
+    agg[timestamp_col] = "last"
+    for c in sum_cols:
+        agg[c] = "sum"
+    for c in mean_cols:
+        agg[c] = "mean"
+    for c in max_cols:
+        agg[c] = "max"
+    for c in last_cols:
+        agg[c] = "last"
+
+    orig_cols = [c for c in tmp.columns]
+    tmp = tmp.set_index(pd.DatetimeIndex(tmp[timestamp_col]))
+    resampled = tmp.resample(f"{minutes}min").agg(agg)
+    resampled = resampled.dropna(subset=[close_col]).reset_index(drop=True)
+    resampled = resampled[[c for c in orig_cols if c in resampled.columns]]
+    return resampled
+
+
 if __name__ == "__main__":
     df_e = data_engineering(
         input_csv="data/BTCUSDT_combined_klines_20210201_20260201_hmm_states4_labeled_lstm_nextregime_ts32_predictions.csv",
