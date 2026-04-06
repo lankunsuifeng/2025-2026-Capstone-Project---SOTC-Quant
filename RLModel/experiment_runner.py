@@ -225,7 +225,7 @@ class RunnerConfig:
     meta_root: str = "result/experiment_meta"
     env_cfg: TradingEnvConfig = field(
         default_factory=lambda: TradingEnvConfig(
-            fee_bps=5.0,
+            fee_bps=2,
             hold_cost_bps=0.0,
             max_episode_steps=10000,
             random_start=True,
@@ -236,7 +236,7 @@ class RunnerConfig:
     ppo_cfg: PPOConfig = field(default_factory=PPOConfig)
     eval_env_cfg: TradingEnvConfig = field(
         default_factory=lambda: TradingEnvConfig(
-            fee_bps=5.0,
+            fee_bps=2,
             hold_cost_bps=0.0,
             max_episode_steps=None,
             random_start=False,
@@ -269,6 +269,53 @@ def _per_hmm_regime_sharpe_table(steps: pd.DataFrame) -> list[dict[str, Any]]:
         )
     rows.sort(key=lambda x: x["hmm_regime_id"])
     return rows
+
+
+def _save_metrics_table_image(mdf: pd.DataFrame, result_root: str) -> None:
+    """Render comparison_metrics DataFrame as a formatted table image."""
+    display = mdf.copy()
+    fmt = {
+        "Sharpe": lambda x: f"{x:.4f}" if np.isfinite(x) else "-",
+        "Calmar": lambda x: f"{x:.4f}" if np.isfinite(x) else "-",
+        "MDD": lambda x: f"{x:.2%}" if np.isfinite(x) else "-",
+        "Return": lambda x: f"{x:.2%}" if np.isfinite(x) else "-",
+        "Turnover_Rate": lambda x: f"{x:.4f}" if np.isfinite(x) else "-",
+    }
+    for col, fn in fmt.items():
+        if col in display.columns:
+            display[col] = display[col].apply(fn)
+    display = display.drop(columns=["bars"], errors="ignore")
+
+    n_rows, n_cols = display.shape
+    col_width = 1.4
+    row_height = 0.45
+    fig_w = max(col_width * n_cols, 8)
+    fig_h = row_height * (n_rows + 1.6)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+    tbl = ax.table(
+        cellText=display.values,
+        colLabels=display.columns,
+        loc="center",
+        cellLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1.0, 1.6)
+    for (r, c), cell in tbl.get_celld().items():
+        if r == 0:
+            cell.set_facecolor("#4472C4")
+            cell.set_text_props(color="white", fontweight="bold")
+        else:
+            cell.set_facecolor("#F2F2F2" if r % 2 == 0 else "white")
+        cell.set_edgecolor("#D9D9D9")
+
+    ax.set_title("Comparison Metrics", fontsize=13, fontweight="bold", pad=12)
+    out_path = os.path.join(result_root, "comparison_metrics_table.png")
+    fig.savefig(out_path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"[aggregate] Wrote metrics table image: {out_path}")
 
 
 def write_aggregate_backtest_reports(
@@ -344,14 +391,21 @@ def write_aggregate_backtest_reports(
             continue
         st = pd.read_csv(path)
         summ = summarize(st)
+        bars = summ.get("bars", 0)
+        ret = summ.get("total_return", float("nan"))
+        mdd = summ.get("max_drawdown", float("nan"))
+        abs_mdd = abs(mdd) if (np.isfinite(mdd) and mdd < 0) else float("nan")
+        calmar = float(ret / abs_mdd) if (np.isfinite(ret) and np.isfinite(abs_mdd) and abs_mdd > 1e-12) else float("nan")
+        tv_sum = summ.get("turnover_sum", 0.0)
+        tv_rate = float(tv_sum / max(bars, 1))
         metric_rows.append(
             {
                 "experiment": eid,
+                "Return": ret,
                 "Sharpe": summ.get("sharpe_step", float("nan")),
-                "MDD": summ.get("max_drawdown", float("nan")),
-                "Return": summ.get("total_return", float("nan")),
-                "Turnover": summ.get("turnover_sum", float("nan")),
-                "bars": summ.get("bars", 0),
+                "Calmar": calmar,
+                "MDD": mdd,
+                "Turnover_Rate": tv_rate,
             }
         )
         for seg in _per_hmm_regime_sharpe_table(st):
@@ -362,6 +416,7 @@ def write_aggregate_backtest_reports(
         mpath = os.path.join(cfg.result_root, "comparison_metrics.csv")
         mdf.to_csv(mpath, index=False)
         print(f"[aggregate] Wrote comparison metrics: {mpath}")
+        _save_metrics_table_image(mdf, cfg.result_root)
     else:
         print("[aggregate] No backtest step CSVs; skipped comparison_metrics.csv")
 
