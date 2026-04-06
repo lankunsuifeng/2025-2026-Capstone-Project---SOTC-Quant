@@ -47,8 +47,10 @@ data/data_e.csv
 # Local generated artifacts (RLModel)
 /RLModel/data/
 /RLModel/model/
+/RLModel/model_backup/
 /RLModel/plots/
 /RLModel/result/
+/RLModel/result_backup/
 
 # Local generated artifacts (HMMLSTM)
 # Ignore datasets/features/models produced by the pipelines & dashboards

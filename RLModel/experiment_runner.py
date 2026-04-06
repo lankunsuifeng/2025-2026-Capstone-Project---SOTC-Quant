@@ -275,11 +275,11 @@ def _save_metrics_table_image(mdf: pd.DataFrame, result_root: str) -> None:
     """Render comparison_metrics DataFrame as a formatted table image."""
     display = mdf.copy()
     fmt = {
-        "Sharpe": lambda x: f"{x:.4f}" if np.isfinite(x) else "-",
-        "Calmar": lambda x: f"{x:.4f}" if np.isfinite(x) else "-",
+        "Sharpe": lambda x: f"{x:.2f}" if np.isfinite(x) else "-",
+        "Calmar": lambda x: f"{x:.2f}" if np.isfinite(x) else "-",
         "MDD": lambda x: f"{x:.2%}" if np.isfinite(x) else "-",
         "Return": lambda x: f"{x:.2%}" if np.isfinite(x) else "-",
-        "Turnover_Rate": lambda x: f"{x:.4f}" if np.isfinite(x) else "-",
+        "Turnover": lambda x: f"{x:.4f}" if np.isfinite(x) else "-",
     }
     for col, fn in fmt.items():
         if col in display.columns:
@@ -398,14 +398,17 @@ def write_aggregate_backtest_reports(
         calmar = float(ret / abs_mdd) if (np.isfinite(ret) and np.isfinite(abs_mdd) and abs_mdd > 1e-12) else float("nan")
         tv_sum = summ.get("turnover_sum", 0.0)
         tv_rate = float(tv_sum / max(bars, 1))
+        sharpe_step = summ.get("sharpe_step", float("nan"))
+        bars_per_year = 365.25 * 24 * (60 / max(cfg.resample_minutes, 5))
+        sharpe_annual = float(sharpe_step * np.sqrt(bars_per_year)) if np.isfinite(sharpe_step) else float("nan")
         metric_rows.append(
             {
                 "experiment": eid,
                 "Return": ret,
-                "Sharpe": summ.get("sharpe_step", float("nan")),
+                "Sharpe": sharpe_annual,
                 "Calmar": calmar,
                 "MDD": mdd,
-                "Turnover_Rate": tv_rate,
+                "Turnover": tv_rate,
             }
         )
         for seg in _per_hmm_regime_sharpe_table(st):
@@ -616,8 +619,19 @@ def run_experiment(exp_id: ExperimentId, df: pd.DataFrame, cfg: RunnerConfig) ->
 def run_experiments(
     experiment_ids: list[ExperimentId],
     cfg: RunnerConfig | None = None,
+    skip_ids: set[str] | None = None,
 ) -> pd.DataFrame:
+    """Run (or skip) experiments, then produce the aggregate report for *all* ids.
+
+    Parameters
+    ----------
+    skip_ids : set of experiment id strings to **skip training** for.
+        Their existing ``*_backtest_steps.csv`` will still be read into the
+        comparison summary and aggregate report so you can retrain a subset
+        while keeping the rest unchanged.
+    """
     cfg = cfg or RunnerConfig()
+    skip_ids = skip_ids or set()
     set_training_seed(int(cfg.env_cfg.seed))
     if not os.path.isfile(cfg.csv_path):
         raise FileNotFoundError(f"CSV not found: {cfg.csv_path}")
@@ -641,9 +655,25 @@ def run_experiments(
 
     for eid in experiment_ids:
         print(f"\n========== Experiment: {eid} ==========")
+
+        if eid in skip_ids:
+            bt_path = os.path.join(cfg.result_root, f"{eid}_backtest_steps.csv")
+            if not os.path.isfile(bt_path):
+                print(f"[{eid}] SKIP requested but {bt_path} not found — skipping entirely")
+                rows.append({"experiment": eid, "kind": "", "error": "skipped; no existing CSV"})
+                continue
+            st = pd.read_csv(bt_path)
+            summ = summarize(st)
+            row: dict[str, Any] = {"experiment": eid, "kind": "skipped", "error": ""}
+            for k, v in summ.items():
+                row[k] = v
+            rows.append(row)
+            print(f"[{eid}] SKIP (--skip): reusing existing backtest → {summ.get('total_return', '?'):.4%} return")
+            continue
+
         try:
             out = run_experiment(eid, df, cfg)
-            row: dict[str, Any] = {"experiment": eid, "kind": out["kind"], "error": ""}
+            row = {"experiment": eid, "kind": out["kind"], "error": ""}
             for k, v in out["summary"].items():
                 row[k] = v
             for k, v in out.get("summary_buy_hold", {}).items():
@@ -673,6 +703,13 @@ def main(argv: list[str] | None = None) -> None:
         type=str,
         default="",
         help="Comma-separated ids: ppo_base,ppo_hmm,ppo_hmm_lstm,moe_hmm,moe_hmm_lstm",
+    )
+    p.add_argument(
+        "--skip",
+        type=str,
+        default="",
+        help="Comma-separated ids to skip training (reuse existing backtest CSV). "
+             "Combined with --all or --only to include them in the aggregate report.",
     )
     p.add_argument("--train-ratio", type=float, default=0.8, help="Fallback if split_config missing")
     p.add_argument("--split-config", type=str, default="", help="Optional path to split_config.json")
@@ -800,7 +837,14 @@ def main(argv: list[str] | None = None) -> None:
     cfg.env_cfg.rolling_sharpe_coef = float(args.rolling_sharpe_coef)
     cfg.eval_env_cfg.rolling_sharpe_coef = float(args.rolling_sharpe_coef)
 
-    run_experiments(selected, cfg)
+    skip_set: set[str] = set()
+    if args.skip.strip():
+        for part in args.skip.split(","):
+            part = part.strip()
+            if part:
+                skip_set.add(part)
+
+    run_experiments(selected, cfg, skip_ids=skip_set)
 
 
 if __name__ == "__main__":
