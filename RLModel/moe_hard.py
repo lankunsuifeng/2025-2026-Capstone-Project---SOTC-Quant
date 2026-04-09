@@ -206,10 +206,9 @@ def _prepare_moe_arrays(df,feature_cols,close_col,regime_cols):
     use = use.dropna().reset_index(drop = True)
     X = use[feature_cols].to_numpy(dtype = np.float32)
     close = use[close_col].to_numpy(dtype = np.float32)
-    regime_ids = (
-        use.loc[:,regime_cols].to_numpy(dtype = np.float32).argmax(axis = 1).astype(np.int64)
-    )
-    return X,close,regime_ids,use
+    regime_probs = use.loc[:,regime_cols].to_numpy(dtype = np.float32)
+    regime_ids = regime_probs.argmax(axis = 1).astype(np.int64)
+    return X,close,regime_ids,regime_probs,use
 
 def get_current_regime(env)-> int:
     if env.regime is None:
@@ -243,11 +242,17 @@ def save_moe_bundle(out_dir,agent,ppo_cfg,env_cfg = None,extra_meta = None):
 
     payload = {
         "n_experts":len(agent.experts),
+        "n_regime_experts": agent.n_experts,
+        "use_general_expert": agent.use_general_expert,
+        "confidence_threshold": agent.confidence_threshold,
         "expert_state_dicts":[expert.state_dict() for expert in agent.experts],
     }
     torch.save(payload,ckpt_path)
     meta = {
         "n_experts":len(agent.experts),
+        "n_regime_experts": agent.n_experts,
+        "use_general_expert": agent.use_general_expert,
+        "confidence_threshold": agent.confidence_threshold,
         "ppo_cfg":_ppo_cfg_to_dict(ppo_cfg),
     }
     if env_cfg is not None:
@@ -288,22 +293,33 @@ def load_moe_bundle(bundle_path,agent,map_location = None):
 
 
 class HardMoEAgent(nn.Module):
-    def __init__(self,obs_dims,cfg,n_actions = 3,n_experts = 4):
+    def __init__(self,obs_dims,cfg,n_actions = 3,n_experts = 4,
+                 use_general_expert: bool = False,confidence_threshold: float = 0.2):
         super().__init__()
         self.cfg = cfg
         self.device = cfg.device
         self.n_actions = n_actions
         self.n_experts = n_experts
+        self.use_general_expert = use_general_expert
+        self.confidence_threshold = confidence_threshold
         self.IDX_TO_ACT = np.array([-1,0,1],dtype = np.int32)
+        total_experts = n_experts + 1 if use_general_expert else n_experts
+        self.general_expert_id = n_experts if use_general_expert else -1
         self.experts = nn.ModuleList(
             [
                 ActorCritic(obs_dim = obs_dims,
                 n_actions = n_actions,
                 hidden = cfg.hidden,).to(self.device)
-                for _ in range(n_experts)
+                for _ in range(total_experts)
             ]
         )
         self.optimizers = [optim.Adam(expert.parameters(),lr = cfg.lr) for expert in self.experts]
+
+    def resolve_expert(self, regime_id: int, confidence_margin: float) -> int:
+        if self.use_general_expert and confidence_margin < self.confidence_threshold:
+            return self.general_expert_id
+        return regime_id
+
     def train_mode(self)->None:
         for expert in self.experts:
             expert.train()
@@ -311,7 +327,7 @@ class HardMoEAgent(nn.Module):
         for expert in self.experts:
             expert.eval()
     def _check_regime_id(self,regime_id:int)->None:
-        if regime_id < 0 or regime_id >= self.n_experts:
+        if regime_id < 0 or regime_id >= len(self.experts):
             raise ValueError("Invalid Regime IDs")
     def get_expert(self,regime_id:int) -> ActorCritic:
         self._check_regime_id(regime_id)
@@ -321,11 +337,12 @@ class HardMoEAgent(nn.Module):
         return expert(obs)
     
     @torch.no_grad()
-    def act(self,obs,regime_id)->tuple:
-        self._check_regime_id(regime_id)
+    def act(self,obs,regime_id,confidence_margin: float = 1.0)->tuple:
+        effective_id = self.resolve_expert(regime_id, confidence_margin)
+        self._check_regime_id(effective_id)
         if obs.ndim !=1:
             raise ValueError("Obs dim is not 1")
-        expert = self.get_expert(regime_id)
+        expert = self.get_expert(effective_id)
         logits,value = expert(obs.unsqueeze(0))
         dist = torch.distributions.Categorical(logits=logits)
         act_idx = dist.sample()
@@ -333,11 +350,12 @@ class HardMoEAgent(nn.Module):
         return act_idx.squeeze(0),logprob.squeeze(0),value.squeeze(0)
     
     @torch.no_grad()
-    def act_deterministic(self,obs,regime_id):
-        self._check_regime_id(regime_id)
+    def act_deterministic(self,obs,regime_id,confidence_margin: float = 1.0):
+        effective_id = self.resolve_expert(regime_id, confidence_margin)
+        self._check_regime_id(effective_id)
         if obs.ndim != 1:
             raise ValueError("Obs dim is not 1")
-        expert = self.get_expert(regime_id)
+        expert = self.get_expert(effective_id)
         logits,value = expert(obs.unsqueeze(0))
         act_idx = int(torch.argmax(logits,dim = -1).item())
         env_action = int(self.IDX_TO_ACT[act_idx])
@@ -418,6 +436,15 @@ class HardMoEAgent(nn.Module):
                     if not torch.any(mask):
                         continue
                     result = self.update_one_expert(expert_id,mb_obs[mask],mb_act[mask],mb_oldlog[mask],mb_adv[mask],mb_ret[mask],ent_coef=ent_coef)
+                    stats["loss"] += result["loss"]
+                    stats["pi_loss"] += result["pi_loss"]
+                    stats["v_loss"] += result["v_loss"]
+                    stats["entropy"] += result["entropy"]
+                    stats["num_updates"] += 1
+                    stats["num_samples"] += result["n_samples"]
+
+                if self.use_general_expert:
+                    result = self.update_one_expert(self.general_expert_id,mb_obs,mb_act,mb_oldlog,mb_adv,mb_ret,ent_coef=ent_coef)
                     stats["loss"] += result["loss"]
                     stats["pi_loss"] += result["pi_loss"]
                     stats["v_loss"] += result["v_loss"]
@@ -527,11 +554,16 @@ def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every =
         regime_counts = np.zeros(agent.n_experts,dtype = np.int64)
 
         for _ in range(agent.cfg.rollout_steps):
-            regime_id = get_current_regime(env)
-            regime_counts[regime_id] += 1
+            if agent.use_general_expert:
+                regime_id, margin = env.get_regime_confidence()
+            else:
+                regime_id = get_current_regime(env)
+                margin = 1.0
+            effective_id = agent.resolve_expert(regime_id, margin)
+            regime_counts[min(regime_id, agent.n_experts - 1)] += 1
 
             with torch.no_grad():
-                act_idx,logprob,value = agent.act(obs,regime_id)
+                act_idx,logprob,value = agent.act(obs,regime_id,confidence_margin=margin)
 
             env_action = int(agent.IDX_TO_ACT[int(act_idx.item())])
             next_obs_np,reward,done,info = env.step(env_action)
@@ -540,7 +572,6 @@ def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every =
             fee_sum += float(info.get("fee",0.0))
             abspos_sum += abs(float(info.get("pos",0.0)))
             turnover_sum += float(info.get("turnover",0.0))
-
 
             buf.add(
                 obs = obs,
@@ -555,8 +586,12 @@ def train_moe_experts(agent:HardMoEAgent,env,total_updates:int = 200,log_every =
 
             obs = torch.tensor(obs_np,dtype=torch.float32,device = agent.device)
         with torch.no_grad():
-            last_regime_id = get_current_regime(env)
-            _,last_value = agent.forward_expert(obs.unsqueeze(0),last_regime_id)
+            if agent.use_general_expert:
+                last_regime_id, last_margin = env.get_regime_confidence()
+                last_eff_id = agent.resolve_expert(last_regime_id, last_margin)
+            else:
+                last_eff_id = get_current_regime(env)
+            _,last_value = agent.forward_expert(obs.unsqueeze(0),last_eff_id)
             last_value = float(last_value.squeeze(0).item())
 
         buf.compute_gae(last_value,agent.cfg.gamma,agent.cfg.gae_lambda)
@@ -616,9 +651,14 @@ def backtest_moe(
     step = 0
 
     while not done:
-        regime_id = get_current_regime(env)
+        if agent.use_general_expert:
+            regime_id, margin = env.get_regime_confidence()
+        else:
+            regime_id = get_current_regime(env)
+            margin = 1.0
+        effective_id = agent.resolve_expert(regime_id, margin)
         obs = torch.tensor(obs_np,dtype = torch.float32,device=agent.device)
-        action,value_est = agent.act_deterministic(obs,regime_id)
+        action,value_est = agent.act_deterministic(obs,regime_id,confidence_margin=margin)
         next_obs_np,reward,done,info = env.step(action)
 
         t = int(info["t"])
@@ -647,7 +687,9 @@ def backtest_moe(
             "equity": float(equity),
             "nav": float(nav),
             "regime_id": int(regime_id),
-            "expert_id": int(regime_id),
+            "expert_id": int(effective_id),
+            "confidence_margin": float(margin),
+            "used_general": int(effective_id == agent.general_expert_id),
             "value_est": float(value_est),
         }
         if "regime" in info:
@@ -662,20 +704,23 @@ def backtest_moe(
 
     return pd.DataFrame(rows)
 
-def run_moe_backtest(bundle_path,env_cfg,data_cfg = None,capital = 1.0,out_csv = None,plot_dir = None,plot_prefix = "moe_hard",compare_buy_hold = True):
+def run_moe_backtest(bundle_path,env_cfg,data_cfg = None,capital = 1.0,out_csv = None,plot_dir = None,plot_prefix = "moe_hard",compare_buy_hold = True,
+                     use_general_expert: bool = False,confidence_threshold: float = 0.2):
     if data_cfg is None:
         data_cfg = MoEDataConfig()
     meta = _load_moe_data(bundle_path)
     ppo_cfg = _ppo_config_from_meta(meta)
-    n_experts = int(meta.get("n_experts",len(data_cfg.regime_cols)))
+    n_regime_experts = len(data_cfg.regime_cols)
+    n_total_in_ckpt = int(meta.get("n_experts", n_regime_experts))
 
     df = pd.read_csv(data_cfg.csv_path)
     _, df_test, _ = moe_train_test_split(df, data_cfg)
     feature_cols = df_test.columns.drop(drop_cols_existing(df_test, data_cfg.drop_cols)).to_list()
-    X_test,close_test,regime_ids_test,df_test_used = _prepare_moe_arrays(df = df_test,feature_cols=feature_cols,close_col=data_cfg.close_col,regime_cols=data_cfg.regime_cols)
+    X_test,close_test,regime_ids_test,regime_probs_test,df_test_used = _prepare_moe_arrays(df = df_test,feature_cols=feature_cols,close_col=data_cfg.close_col,regime_cols=data_cfg.regime_cols)
 
     if len(regime_ids_test) != len(X_test):
         regime_ids_test = regime_ids_test[-len(X_test):]
+        regime_probs_test = regime_probs_test[-len(X_test):]
     eval_env_cfg = TradingEnvConfig(
         fee_bps=env_cfg.fee_bps,
         hold_cost_bps=env_cfg.hold_cost_bps,
@@ -692,8 +737,11 @@ def run_moe_backtest(bundle_path,env_cfg,data_cfg = None,capital = 1.0,out_csv =
         rolling_sharpe_coef=env_cfg.rolling_sharpe_coef,
         rolling_sharpe_clip=env_cfg.rolling_sharpe_clip,
     )
-    env = TradingEnv(X_test,close_test,eval_env_cfg,regime_ids=regime_ids_test)
-    agent = HardMoEAgent(obs_dims=env.obs_dim(),cfg=ppo_cfg,n_experts=n_experts)
+    env = TradingEnv(X_test,close_test,eval_env_cfg,regime_ids=regime_ids_test,
+                     regime_probs=regime_probs_test if use_general_expert else None)
+    has_general = use_general_expert or (n_total_in_ckpt > n_regime_experts)
+    agent = HardMoEAgent(obs_dims=env.obs_dim(),cfg=ppo_cfg,n_experts=n_regime_experts,
+                         use_general_expert=has_general,confidence_threshold=confidence_threshold)
     load_moe_bundle(bundle_path,agent,map_location=agent.device)
     hmm_regime_ids = None
     if all(c in df_test_used.columns for c in _HMM_PRED_OH):
@@ -766,7 +814,7 @@ if __name__ == "__main__":
     df = pd.read_csv(data_cfg.csv_path)
     df_train, _, split_meta = moe_train_test_split(df, data_cfg)
     feature_cols = df_train.columns.drop(drop_cols_existing(df_train, data_cfg.drop_cols)).tolist()
-    X_train, close_train, regime_ids_train, _ = _prepare_moe_arrays(
+    X_train, close_train, regime_ids_train, _, _ = _prepare_moe_arrays(
         df=df_train,
         feature_cols=feature_cols,
         close_col=data_cfg.close_col,

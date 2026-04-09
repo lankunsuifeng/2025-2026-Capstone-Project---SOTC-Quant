@@ -1,11 +1,12 @@
 """
-Unified runner for five RL experiments (same train/test calendar as MoE when split_config is used).
+Unified runner for RL experiments (same train/test calendar as MoE when split_config is used).
 
-  1. PPO-Base          — tech features only (no HMM/LSTM regime columns)
-  2. PPO+HMM           — tech + hmm_predicted_state_0..3 (HMM next-bar label / target)
-  3. PPO+HMM+LSTM      — tech + hmm_predicted_state_0..3 + lstm_predicted_state_0..3
-  4. MoE+HMM           — routed by HMM predicted one-hot; obs without those
-  5. MoE+HMM+LSTM      — routed by LSTM one-hot; obs includes HMM predicted one-hot
+  1. PPO-Base             — tech features only (no HMM/LSTM regime columns)
+  2. PPO+HMM              — tech + hmm_predicted_state_0..3 (HMM next-bar label / target)
+  3. PPO+HMM+LSTM         — tech + hmm_predicted_state_0..3 + lstm_predicted_state_0..3
+  4. MoE+HMM              — routed by HMM predicted one-hot; obs without those
+  5. MoE+HMM+LSTM         — routed by LSTM one-hot; obs includes HMM predicted one-hot
+  6. MoE+HMM+LSTM+General — like (5) but routes to a general expert when LSTM confidence is low
 
 Requires ``data_e.csv`` from ``data_process.data_engineering`` (``pred_state_source="both"``):
 ``timestamp``, ``close_5m``, ``hmm_predicted_state_0``..``_3``, ``lstm_predicted_state_0``..``_3``.
@@ -17,7 +18,7 @@ After ``run_experiments``, ``result_root`` also gets ``equity_overlay.png``,
 Usage (from ``RLModel/``)::
 
     python experiment_runner.py --csv data/data_e.csv --all
-    python experiment_runner.py --csv data/data_e.csv --only ppo_base,mo_e_hmm_lstm
+    python experiment_runner.py --csv data/data_e.csv --only ppo_base,moe_hmm_lstm,moe_hmm_lstm_general
 """
 from __future__ import annotations
 
@@ -58,6 +59,7 @@ ExperimentId = Literal[
     "ppo_hmm_lstm",
     "moe_hmm",
     "moe_hmm_lstm",
+    "moe_hmm_lstm_general",
 ]
 
 EXPERIMENT_ORDER: tuple[ExperimentId, ...] = (
@@ -66,6 +68,7 @@ EXPERIMENT_ORDER: tuple[ExperimentId, ...] = (
     "ppo_hmm_lstm",
     "moe_hmm",
     "moe_hmm_lstm",
+    "moe_hmm_lstm_general",
 )
 
 
@@ -168,11 +171,11 @@ def _validate(exp_id: ExperimentId, df: pd.DataFrame) -> None:
     for c in ("timestamp", "close_5m"):
         if c not in df.columns:
             raise ValueError(f"CSV missing required column {c!r}")
-    if exp_id in ("ppo_hmm", "ppo_hmm_lstm", "moe_hmm", "moe_hmm_lstm"):
+    if exp_id in ("ppo_hmm", "ppo_hmm_lstm", "moe_hmm", "moe_hmm_lstm", "moe_hmm_lstm_general"):
         missing = [c for c in HMM_OH if c not in df.columns]
         if missing:
             raise ValueError(f"{exp_id}: missing HMM predicted-state columns {missing}")
-    if exp_id in ("ppo_hmm_lstm", "moe_hmm_lstm"):
+    if exp_id in ("ppo_hmm_lstm", "moe_hmm_lstm", "moe_hmm_lstm_general"):
         missing = [c for c in LSTM_OH if c not in df.columns]
         if missing:
             raise ValueError(f"{exp_id}: missing LSTM predicted-state columns {missing}")
@@ -198,7 +201,7 @@ def _moe_data_cfg(exp_id: ExperimentId, df: pd.DataFrame, csv_path: str, train_r
             train_ratio=train_ratio,
             split_config_path=split_config_path,
         )
-    if exp_id == "moe_hmm_lstm":
+    if exp_id in ("moe_hmm_lstm", "moe_hmm_lstm_general"):
         return MoEDataConfig(
             csv_path=csv_path,
             close_col="close_5m",
@@ -223,6 +226,7 @@ class RunnerConfig:
     model_root: str = "model/experiments"
     result_root: str = "result/experiments"
     meta_root: str = "result/experiment_meta"
+    confidence_threshold: float = 0.2
     env_cfg: TradingEnvConfig = field(
         default_factory=lambda: TradingEnvConfig(
             fee_bps=2,
@@ -523,7 +527,7 @@ def train_and_backtest_moe(
     if cfg.close_col in feature_cols:
         feature_cols = [c for c in feature_cols if c != cfg.close_col]
 
-    X_train, close_train, regime_ids_train, _ = _prepare_moe_arrays(
+    X_train, close_train, regime_ids_train, _probs, _ = _prepare_moe_arrays(
         df=df_train,
         feature_cols=feature_cols,
         close_col=data_cfg.close_col,
@@ -608,11 +612,120 @@ def train_and_backtest_moe(
     return {"experiment": exp_id, "kind": "moe", "summary": summary, "summary_buy_hold": summary_bh, "meta": meta}
 
 
+def train_and_backtest_moe_general(
+    exp_id: ExperimentId,
+    df: pd.DataFrame,
+    cfg: RunnerConfig,
+) -> dict[str, Any]:
+    """Train MoE with a general expert fallback when LSTM confidence is low."""
+    _validate(exp_id, df)
+    data_cfg = _moe_data_cfg(exp_id, df, cfg.csv_path, cfg.train_ratio, cfg.split_config_path)
+
+    df_train, df_test, split_meta = moe_train_test_split(df, data_cfg)
+    feature_cols = df_train.columns.drop(drop_cols_existing(df_train, data_cfg.drop_cols)).tolist()
+    if cfg.close_col in feature_cols:
+        feature_cols = [c for c in feature_cols if c != cfg.close_col]
+
+    X_train, close_train, regime_ids_train, regime_probs_train, _ = _prepare_moe_arrays(
+        df=df_train,
+        feature_cols=feature_cols,
+        close_col=data_cfg.close_col,
+        regime_cols=data_cfg.regime_cols,
+    )
+
+    train_env = TradingEnv(
+        X_train,
+        close_train,
+        cfg.env_cfg,
+        regime_ids=regime_ids_train,
+        regime_probs=regime_probs_train,
+    )
+    n_regime_experts = len(data_cfg.regime_cols)
+    agent = HardMoEAgent(
+        obs_dims=train_env.obs_dim(),
+        cfg=cfg.ppo_cfg,
+        n_experts=n_regime_experts,
+        use_general_expert=True,
+        confidence_threshold=cfg.confidence_threshold,
+    )
+    agent, history = train_moe_experts(
+        agent=agent,
+        env=train_env,
+        total_updates=cfg.total_updates,
+        log_every=cfg.log_every,
+    )
+
+    model_dir = os.path.join(cfg.model_root, exp_id)
+    os.makedirs(model_dir, exist_ok=True)
+    bundle_path = os.path.join(model_dir, "moe_experts.pt")
+    save_moe_bundle(
+        out_dir=model_dir,
+        agent=agent,
+        ppo_cfg=cfg.ppo_cfg,
+        env_cfg=cfg.env_cfg,
+        extra_meta={
+            "experiment": exp_id,
+            "data_cfg": {
+                "csv_path": data_cfg.csv_path,
+                "close_col": data_cfg.close_col,
+                "regime_cols": list(data_cfg.regime_cols),
+                "drop_cols": list(data_cfg.drop_cols),
+                "train_ratio": data_cfg.train_ratio,
+                "split_config_path": data_cfg.split_config_path,
+            },
+            "train_rows": int(len(df_train)),
+            "test_rows": int(len(df_test)),
+            "total_updates": cfg.total_updates,
+            "split": split_meta,
+            "feature_cols": feature_cols,
+            "confidence_threshold": cfg.confidence_threshold,
+        },
+    )
+
+    meta = {
+        "experiment": exp_id,
+        "type": "moe_general",
+        "bundle": bundle_path,
+        "confidence_threshold": cfg.confidence_threshold,
+        "data_cfg": {
+            "csv_path": data_cfg.csv_path,
+            "close_col": data_cfg.close_col,
+            "regime_cols": list(data_cfg.regime_cols),
+            "drop_cols": list(data_cfg.drop_cols),
+            "train_ratio": data_cfg.train_ratio,
+            "split_config_path": data_cfg.split_config_path,
+        },
+        "split": split_meta,
+    }
+    os.makedirs(cfg.meta_root, exist_ok=True)
+    with open(os.path.join(cfg.meta_root, f"{exp_id}.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, default=str)
+
+    bt = run_moe_backtest(
+        bundle_path=bundle_path,
+        env_cfg=cfg.eval_env_cfg,
+        data_cfg=data_cfg,
+        capital=cfg.capital,
+        out_csv=os.path.join(cfg.result_root, f"{exp_id}_backtest_steps.csv"),
+        plot_dir=os.path.join(cfg.result_root, f"{exp_id}_plots"),
+        plot_prefix=exp_id,
+        compare_buy_hold=True,
+        use_general_expert=True,
+        confidence_threshold=cfg.confidence_threshold,
+    )
+    summary = {k: float(v) if isinstance(v, (int, float)) else v for k, v in bt["summary"].items()}
+    bh = bt.get("buy_hold_summary") or {}
+    summary_bh = {f"bh_{k}": float(v) if isinstance(v, (int, float)) else v for k, v in bh.items()}
+    return {"experiment": exp_id, "kind": "moe_general", "summary": summary, "summary_buy_hold": summary_bh, "meta": meta}
+
+
 def run_experiment(exp_id: ExperimentId, df: pd.DataFrame, cfg: RunnerConfig) -> dict[str, Any]:
     if exp_id in ("ppo_base", "ppo_hmm", "ppo_hmm_lstm"):
         return train_and_backtest_ppo(exp_id, df, cfg)
     if exp_id in ("moe_hmm", "moe_hmm_lstm"):
         return train_and_backtest_moe(exp_id, df, cfg)
+    if exp_id == "moe_hmm_lstm_general":
+        return train_and_backtest_moe_general(exp_id, df, cfg)
     raise ValueError(f"Unknown experiment: {exp_id}")
 
 
@@ -702,7 +815,7 @@ def main(argv: list[str] | None = None) -> None:
         "--only",
         type=str,
         default="",
-        help="Comma-separated ids: ppo_base,ppo_hmm,ppo_hmm_lstm,moe_hmm,moe_hmm_lstm",
+        help="Comma-separated ids: ppo_base,ppo_hmm,ppo_hmm_lstm,moe_hmm,moe_hmm_lstm,moe_hmm_lstm_general",
     )
     p.add_argument(
         "--skip",
@@ -774,6 +887,13 @@ def main(argv: list[str] | None = None) -> None:
         default=0.01,
         help="Multiplier on clipped rolling Sharpe added to reward (before --reward-scale).",
     )
+    p.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.2,
+        help="Margin threshold for general-expert fallback in moe_hmm_lstm_general (0-1). "
+             "Lower = use general expert less often.",
+    )
     args = p.parse_args(argv)
 
     if args.all:
@@ -836,6 +956,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg.eval_env_cfg.rolling_sharpe_window = int(args.rolling_sharpe_window)
     cfg.env_cfg.rolling_sharpe_coef = float(args.rolling_sharpe_coef)
     cfg.eval_env_cfg.rolling_sharpe_coef = float(args.rolling_sharpe_coef)
+    cfg.confidence_threshold = float(args.confidence_threshold)
 
     skip_set: set[str] = set()
     if args.skip.strip():

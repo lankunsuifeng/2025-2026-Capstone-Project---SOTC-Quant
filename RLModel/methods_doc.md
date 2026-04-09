@@ -136,8 +136,38 @@ where `L_clip` is the clipped surrogate objective (clip ratio epsilon = 0.2), `L
 |---------|---------------|
 | `moe_hmm` | HMM predicted regime (argmax of one-hot) |
 | `moe_hmm_lstm` | LSTM predicted regime (argmax of one-hot) |
+| `moe_hmm_lstm_general` | LSTM predicted regime with low-confidence fallback to a general expert |
 
 In the LSTM-routed variant (`moe_hmm_lstm`), HMM one-hot features are still included in the observation; only the routing decision uses the LSTM prediction.
+
+### Confidence-based fallback routing (general expert)
+
+To make MoE routing more robust to uncertain regime predictions, `moe_hmm_lstm_general` adds an extra "general expert" trained on all regimes and uses it when the LSTM prediction confidence is low.
+
+**Regime confidence**: For the LSTM softmax probability vector \(p_t \in \mathbb{R}^K\) at time \(t\), define the confidence margin:
+
+\[
+\text{margin}(t) = \max_k p_t(k) - \text{second\_max}_k\, p_t(k)
+\]
+
+**Routing rule** (with threshold \(\tau\) = `--confidence-threshold`):
+
+- If \(\text{margin}(t) < \tau\): route to **general expert**
+- Else: route to the **regime expert** \(\arg\max_k p_t(k)\)
+
+**Training**:
+
+- Regime experts (K=4) are updated only on samples whose `regime_id` equals that expert id (same as the original hard MoE).
+- The general expert is updated on **all** samples in each minibatch (shared data across regimes), so it learns a broad policy that is less sensitive to regime misclassification.
+
+**Where to observe routing outcomes**:
+
+During evaluation/backtest, each step is written to `result/experiments/moe_hmm_lstm_general_backtest_steps.csv` and includes:
+
+- `regime_id`: argmax regime (from LSTM probs)
+- `confidence_margin`: \(\text{margin}(t)\)
+- `expert_id`: the actual expert used after applying the threshold rule
+- `used_general`: 1 if routed to the general expert, else 0
 
 ---
 

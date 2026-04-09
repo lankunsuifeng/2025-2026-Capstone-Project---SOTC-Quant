@@ -82,7 +82,7 @@ class TradingEnvConfig:
 
 
 class TradingEnv:
-    def __init__(self,X,close,cfg = TradingEnvConfig(),regime_ids=None):
+    def __init__(self,X,close,cfg = TradingEnvConfig(),regime_ids=None,regime_probs=None):
         assert isinstance(X,np.ndarray) and isinstance(close,np.ndarray)
         assert X.ndim == 2 and close.ndim == 1
         assert len(X) == len(close)
@@ -92,11 +92,16 @@ class TradingEnv:
             regime_ids = np.asarray(regime_ids,dtype = np.int64)
             assert regime_ids.ndim == 1
             assert len(regime_ids) == len(close)
+        if regime_probs is not None:
+            regime_probs = np.asarray(regime_probs,dtype = np.float32)
+            assert regime_probs.ndim == 2
+            assert len(regime_probs) == len(close)
 
         self.X = X.astype(np.float32)
         self.close = close.astype(np.float32)
         self.cfg = cfg
         self.regime = regime_ids
+        self.regime_probs = regime_probs
         self.fee = cfg.fee_bps / 1e4
         self.hold_cost = cfg.hold_cost_bps/1e4
         self.rng = np.random.default_rng(cfg.seed)
@@ -115,6 +120,17 @@ class TradingEnv:
 
     def obs_dim(self)->int:
         return self.X.shape[1] + 3
+
+    def get_regime_confidence(self) -> tuple[int, float]:
+        """Return (argmax_regime_id, confidence_margin) where margin = top1_prob - top2_prob."""
+        if self.regime_probs is None:
+            rid = int(self.regime[self.t]) if self.regime is not None else 0
+            return rid, 1.0
+        probs = self.regime_probs[self.t]
+        sorted_p = np.sort(probs)[::-1]
+        regime_id = int(np.argmax(probs))
+        margin = float(sorted_p[0] - sorted_p[1])
+        return regime_id, margin
 
     def reset(self) -> np.ndarray:
         self.pos = 0
